@@ -1,0 +1,94 @@
+defaults:
+  - common
+  - wandb
+  - env: combo_go2Piper_pickle_reaching_extreme_velcmd_arm_swing
+  - runner: on_policy_runner
+  - _self_
+
+runner:
+  max_iterations: 10000  # MoE通常需要更少的迭代次数
+  device: ${env.sim_device}
+  alg:
+    _target_: legged_gym.rsl_rl.algorithms.ppo_moe.PPOMoE
+    gamma: 0.99
+    entropy_coef: 0.01
+    moe_weight_regularization: 0.01
+    # 使用MoE actor-critic
+    actor_critic:
+      init_noise_std: 1.0
+      _target_: legged_gym.rsl_rl.modules.actor_critic_moe.ActorCriticMoE
+      num_actor_obs: ${eval:"int(${env.cfg.env.num_observations})*int(${env.obs_history_len})"}
+      num_critic_obs: ${env.cfg.env.num_privileged_obs}
+      num_actions: ${env.cfg.env.num_actions}
+      freeze_experts: true
+      # 需要指定预训练专家模型的路径
+      base_ckpt_path: "/home/group16/xuws/umi-on-legs-compose/mani-centric-wbc/checkpoints/base/model_20000.pt"  # 替换为实际路径
+      arm_ckpt_path: "/home/group16/xuws/umi-on-legs-compose/mani-centric-wbc/checkpoints/pushing/model_18000.pt"    # 替换为实际路径
+      
+      # 基础专家ActorCritic配置
+      base_actor_critic:
+        _target_: legged_gym.rsl_rl.modules.ActorCritic
+        num_actions: ${env.cfg.env.num_actions}
+        init_noise_std: 1.0
+        actor:
+          _target_: torch.nn.Sequential
+          _args_:
+            - _target_: torch.nn.Linear
+              in_features: ${eval:"int(${env.cfg.env.num_observations})*int(${env.obs_history_len})"}
+              out_features: 128
+            - _target_: torch.nn.ELU
+            - _target_: torch.nn.Linear
+              in_features: 128
+              out_features: 64
+            - _target_: torch.nn.ELU
+            - _target_: torch.nn.Linear
+              in_features: 64
+              out_features: 32
+            - _target_: torch.nn.ELU
+            - _target_: torch.nn.Linear
+              in_features: 32
+              out_features: ${env.cfg.env.num_actions}
+        critic:
+          _target_: torch.nn.Sequential
+          _args_:
+            - _target_: torch.nn.Linear
+              in_features: ${env.cfg.env.num_privileged_obs}
+              out_features: 128
+            - _target_: torch.nn.ELU
+            - _target_: torch.nn.Linear
+              in_features: 128
+              out_features: 64
+            - _target_: torch.nn.ELU
+            - _target_: torch.nn.Linear
+              in_features: 64
+              out_features: 32
+            - _target_: torch.nn.ELU
+            - _target_: torch.nn.Linear
+              in_features: 32
+              out_features: 1
+      
+      # 手臂专家ActorCritic配置（与base相同的结构）
+      arm_actor_critic:
+        _target_: legged_gym.rsl_rl.modules.ActorCritic
+        num_actions: ${env.cfg.env.num_actions}
+        init_noise_std: 1.0
+        actor: ${..base_actor_critic.actor}
+        critic: ${..base_actor_critic.critic}
+      
+      # MoE权重网络配置
+      obs_moe:
+        _target_: legged_gym.rsl_rl.modules.obs_moe.ObsMoE
+        obs_dim: ${eval:"int(${env.cfg.env.num_observations})*int(${env.obs_history_len})"}
+        hidden_dims: [128, 64]
+        num_experts: 2
+
+env:
+  seed: ${seed}
+  vis_resolution: ${runner.vis_resolution}
+  cfg:
+    env:
+      send_timeouts: true
+
+ckpt_path: null
+use_noise: True
+seed: 42 

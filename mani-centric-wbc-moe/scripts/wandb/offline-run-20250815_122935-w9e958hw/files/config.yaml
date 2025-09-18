@@ -1,0 +1,733 @@
+seed: 0
+wandb:
+  project: quadruped
+  tags: null
+  group: null
+  resume: false
+  mode: offline
+env:
+  cfg:
+    rewards:
+      scales:
+        orientation: -1.0
+      only_positive_rewards: true
+      base_cmd_tracking_sigma: 0.5
+      base_cmd_reward_scale: 10.0
+      task_reward_attenuation: 0.0
+    env:
+      num_observations: 106
+      num_privileged_obs: 238
+      num_actions: 18
+      num_envs: 1
+      episode_length_s: 7.0
+      send_timeouts: true
+    terrain:
+      _convert_: all
+      static_friction: 1.0
+      dynamic_friction: 1.0
+      restitution: 0.0
+      mode: plane
+      tot_cols: 2000
+      tot_rows: 2000
+      zScale: 0.15
+      horizontal_scale: 0.05
+      vertical_scale: 1.0e-05
+      slope_threshold: 100000000
+      safety_margin: 10.0
+      transform_x: -50.0
+      transform_y: -50.0
+      transform_z: 0.0
+      measured_points_x:
+      - -0.4
+      - -0.3
+      - -0.2
+      - -0.1
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      measured_points_y:
+      - -0.4
+      - -0.3
+      - -0.2
+      - -0.1
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      border_size: 0.0
+    init_state:
+      pos:
+      - -0.5
+      - 0.0
+      - 0.3
+      rot:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      lin_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+      ang_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+      pos_noise:
+      - 0.0
+      - 0.0
+      - 0.0
+      euler_noise:
+      - 0.0
+      - 0.0
+      - 0.0
+      lin_vel_noise:
+      - 0.0
+      - 0.0
+      - 0.0
+      ang_vel_noise:
+      - 0.0
+      - 0.0
+      - 0.0
+    asset:
+      file: '{LEGGED_GYM_ROOT_DIR}/resources/robots/go2_piper/urdf/go2_piper.urdf'
+      name: go2Piper
+      terminate_after_contacts_on:
+      - base
+      - hip
+      - Head
+      - thigh
+      - base_arm_link
+      - link1
+      - link2
+      - link3
+      - link4
+      - link5
+      force_sensor_links:
+      - FR_foot
+      - FL_foot
+      - RR_foot
+      - RL_foot
+      self_collisions: 0
+      collapse_fixed_joints: true
+      disable_gravity: false
+      fix_base_link: false
+      default_dof_drive_mode: 3
+      replace_cylinder_with_capsule: true
+      flip_visual_attachments: false
+      density: 0.001
+      angular_damping: 0.0
+      linear_damping: 0.0
+      max_angular_velocity: 1000.0
+      max_linear_velocity: 1000.0
+      armature: 0.0
+      thickness: 0.01
+    domain_rand:
+      friction_range:
+      - 0.1
+      - 8.0
+      randomize_friction: true
+      num_friction_buckets: 64
+      randomize_rigid_body_masses:
+      - base
+      - link1
+      - link3
+      - link5
+      - link6
+      added_mass_range:
+      - -0.25
+      - 0.25
+      randomize_rigid_body_com:
+      - base
+      - link1
+      - link3
+      - link5
+      - link6
+      rigid_body_com_range:
+        _target_: torch.tensor
+        device: cuda:0
+        data:
+        - - -0.1
+          - -0.1
+          - -0.1
+        - - 0.1
+          - 0.1
+          - 0.1
+      transport_robots: false
+      transport_interval_s: 4.0
+      transport_pos_noise_std:
+        _target_: torch.tensor
+        device: cuda:0
+        data:
+        - 0.1
+        - 0.1
+        - 0.01
+      transport_euler_noise_std:
+        _target_: torch.tensor
+        device: cuda:0
+        data:
+        - 0.01
+        - 0.01
+        - 0.5
+      push_robots: false
+      push_interval_s: 5.0
+      max_push_vel:
+        _target_: torch.tensor
+        data:
+        - 1.0
+        - 1.0
+        - 0.0
+        - 1.0
+        - 1.0
+        - 1.0
+        device: cuda:0
+      randomize_pd_params: true
+      kp_ratio_range:
+      - 0.5
+      - 1.5
+      kd_ratio_range:
+      - 0.5
+      - 1.5
+      randomize_dof_damping: true
+      dof_damping_range:
+      - 0.01
+      - 0.5
+      randomize_dof_friction: true
+      dof_friction_range:
+      - 0.0
+      - 0.05
+      randomize_dof_velocity: false
+      dof_velocity_range:
+      - 5.0
+      - 20.0
+      restitution_coef_range:
+      - 0.0
+      - 1.0
+      randomize_restitution_rigid_bodies: []
+      base_com_range:
+        data:
+        - - -0.1
+          - -0.1
+          - -0.1
+        - - 0.1
+          - 0.1
+          - 0.1
+    viewer:
+      ref_env: 0
+      pos:
+      - 1
+      - 1
+      - 1
+      lookat:
+      - 0.0
+      - 0.0
+      - 0.0
+    sim:
+      dt: 0.005
+      substeps: 1
+      gravity:
+      - 0.0
+      - 0.0
+      - -9.81
+      up_axis: 1
+      use_gpu_pipeline: true
+      physx:
+        num_threads: 10
+        solver_type: 1
+        num_position_iterations: 4
+        num_velocity_iterations: 0
+        friction_offset_threshold: 0.04
+        contact_offset: 0.01
+        rest_offset: 0.0
+        bounce_threshold_velocity: 0.5
+        max_depenetration_velocity: 1.0
+        max_gpu_contact_pairs: 16777216
+        default_buffer_size_multiplier: 4
+        contact_collection: 1
+    curriculum:
+      stage: 1
+      transition_steps: 1000000
+      arm_swing_enabled: false
+      arm_swing_amplitude: 0.5
+    arm_control:
+      kp: 100.0
+      kd: 1.0
+  headless: false
+  seed: 0
+  sim_device: cuda:0
+  vis_resolution:
+  - 144
+  - 256
+  graphics_device_id: 0
+  _target_: legged_gym.env.isaacgym.env_velcmd_arm_swing.IsaacGymEnvVelCmdArmSwing
+  dof_pos_reset_range_scale: 0
+  env_spacing: 3.0
+  attach_camera: true
+  dense_rewards: false
+  ctrl_buf_len: 4
+  ctrl_delay:
+    _convert_: all
+    _target_: torch.tensor
+    data:
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    - 0.02
+    device: cuda:0
+  max_action_value: 100.0
+  obs_history_len: 1
+  tasks:
+    _target_: collections.OrderedDict
+    reaching:
+      _partial_: true
+      _target_: legged_gym.env.isaacgym.task.ReachingLinkTask
+      link_name: end_effector
+      pos_obs_scale: 10.0
+      orn_obs_scale: 1.5
+      pos_err_sigma: 0.5
+      orn_err_sigma: 1.5
+      pos_reward_scale: 0.0
+      orn_reward_scale: 0.0
+      pose_reward_scale: 4.0
+      target_obs_times:
+      - 0.02
+      - 0.04
+      - 0.06
+      - 1.0
+      init_pos_curriculum_level: 1
+      init_orn_curriculum_level: 1
+      target_relative_to_base: false
+      pose_latency_warmup_steps: 0
+      pose_latency_warmup_start: 0
+      pose_latency: 0.0
+      pose_latency_variability: null
+      storage_device: cpu
+      sequence_sampler:
+        _target_: legged_gym.env.isaacgym.pose_sequence.PicklePoseSequenceLoader
+        device: cuda:0
+        episode_length_s: 7.0
+        dt: 0.005
+        file_path: data/pushing.pkl
+        planar_center: true
+        add_random_height_range: null
+      pos_sigma_curriculum:
+        100.0: 2.0
+        1.0: 1.0
+        0.8: 0.5
+        0.5: 0.1
+        0.4: 0.05
+        0.2: 0.01
+        0.1: 0.005
+      orn_sigma_curriculum:
+        100.0: 8.0
+        1.0: 4.0
+        0.8: 2.0
+        0.6: 1.0
+        0.2: 0.5
+      smoothing_dt_multiplier: 0.25
+      position_noise: 0.0
+      euler_noise: 0.0
+      pos_obs_clip: null
+      position_obs_encoding: linear
+  controller:
+    _target_: legged_gym.env.isaacgym.control.PositionController
+    _convert_: all
+    seed: 0
+    control_dim: 18
+    device: cuda:0
+    decimation_count: 4
+    num_envs: 1
+    offset:
+      _target_: torch.tensor
+      data:
+      - 0.1
+      - 0.8
+      - -1.5
+      - -0.1
+      - 0.8
+      - -1.5
+      - 0.1
+      - 1.0
+      - -1.5
+      - -0.1
+      - 1.0
+      - -1.5
+      - 0.0
+      - 0.5
+      - -0.5
+      - 0.0
+      - 0.0
+      - 0.0
+      device: cuda:0
+    torque_limit:
+      _target_: torch.tensor
+      device: cuda:0
+      data:
+      - 23.7
+      - 23.7
+      - 35.5
+      - 23.7
+      - 23.7
+      - 35.5
+      - 23.7
+      - 23.7
+      - 35.5
+      - 23.7
+      - 23.7
+      - 35.5
+      - 20.0
+      - 20.0
+      - 15.0
+      - 7.0
+      - 5.0
+      - 5.0
+    scale:
+      _target_: torch.tensor
+      device: cuda:0
+      data:
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+    kp:
+      _target_: torch.tensor
+      device: cuda:0
+      data:
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 100.0
+      - 100.0
+      - 100.0
+      - 20.0
+      - 20.0
+      - 5.0
+    kd:
+      _target_: torch.tensor
+      device: cuda:0
+      data:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+      - 3.0
+      - 2.0
+      - 1.0
+      - 0.5
+  state_obs:
+    _target_: collections.OrderedDict
+    _convert_: all
+    root_ang_vel:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: local_root_ang_vel
+      dim: 3
+      scale: 0.25
+      noise_std: 0.05
+      clip: 100.0
+      offset: null
+    local_root_gravity:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: local_root_gravity
+      dim: 3
+      scale: null
+      noise_std: 0.05
+      clip: 100.0
+      offset: null
+    dof_pos:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: dof_pos
+      dim: 18
+      scale: 1.0
+      noise_std: 0.01
+      clip: 100.0
+      offset:
+        _target_: torch.tensor
+        data:
+        - 0.1
+        - 0.8
+        - -1.5
+        - -0.1
+        - 0.8
+        - -1.5
+        - 0.1
+        - 1.0
+        - -1.5
+        - -0.1
+        - 1.0
+        - -1.5
+        - 0.0
+        - 0.5
+        - -0.5
+        - 0.0
+        - 0.0
+        - 0.0
+        device: cuda:0
+    dof_vel:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: dof_vel
+      dim: 18
+      scale: 0.05
+      noise_std: 0.075
+      clip: 100.0
+      offset: null
+  setup_obs:
+    _target_: collections.OrderedDict
+  privileged_state_obs:
+    _target_: collections.OrderedDict
+    _convert_: all
+    root_lin_vel:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: local_root_lin_vel
+      dim: 3
+      scale: 2.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+    root_ang_vel:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: local_root_ang_vel
+      dim: 3
+      scale: 0.25
+      noise_std: null
+      clip: 100.0
+      offset: null
+    local_root_gravity:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: local_root_gravity
+      dim: 3
+      scale: null
+      noise_std: null
+      clip: 100.0
+      offset: null
+    dof_pos:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: dof_pos
+      dim: 18
+      scale: 1.0
+      noise_std: null
+      clip: 100.0
+      offset:
+        _target_: torch.tensor
+        data:
+        - 0.1
+        - 0.8
+        - -1.5
+        - -0.1
+        - 0.8
+        - -1.5
+        - 0.1
+        - 1.0
+        - -1.5
+        - -0.1
+        - 1.0
+        - -1.5
+        - 0.0
+        - 0.5
+        - -0.5
+        - 0.0
+        - 0.0
+        - 0.0
+        device: cuda:0
+    dof_vel:
+      _target_: legged_gym.env.isaacgym.obs.EnvObservationAttribute
+      key: dof_vel
+      dim: 18
+      scale: 0.05
+      noise_std: null
+      clip: 100.0
+      offset: null
+  privileged_setup_obs:
+    _target_: collections.OrderedDict
+    kp:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: kp
+      dim: 18
+      scale: 0.1
+      noise_std: null
+      clip: 100.0
+      offset: null
+    kd:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: kd
+      dim: 18
+      scale: 10
+      noise_std: null
+      clip: 100.0
+      offset: null
+    rigidbody_mass:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: rigidbody_mass
+      dim: 5
+      scale: 1.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+    rigidbody_com_offset:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: rigidbody_com_offset
+      dim: 15
+      scale: 10.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+    rigidbody_restitution_coef:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: rigidbody_restitution_coef
+      dim: 0
+      scale: 5.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+    dof_friction:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: dof_friction
+      dim: 18
+      scale: 10.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+    dof_damping:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: dof_damping
+      dim: 18
+      scale: 1.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+    rigid_shape_friction:
+      _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+      key: rigid_shape_friction
+      dim: 37
+      scale: 1.0
+      noise_std: null
+      clip: 100.0
+      offset: null
+  constraints: {}
+runner:
+  alg:
+    actor_critic:
+      actor:
+        _target_: torch.nn.Sequential
+        _args_:
+        - _target_: torch.nn.Linear
+          in_features: 106
+          out_features: 128
+        - _target_: torch.nn.ELU
+        - _target_: torch.nn.Linear
+          in_features: 128
+          out_features: 64
+        - _target_: torch.nn.ELU
+        - _target_: torch.nn.Linear
+          in_features: 64
+          out_features: 32
+        - _target_: torch.nn.ELU
+        - _target_: torch.nn.Linear
+          in_features: 32
+          out_features: 18
+      critic:
+        _target_: torch.nn.Sequential
+        _args_:
+        - _target_: torch.nn.Linear
+          in_features: 238
+          out_features: 128
+        - _target_: torch.nn.ELU
+        - _target_: torch.nn.Linear
+          in_features: 128
+          out_features: 64
+        - _target_: torch.nn.ELU
+        - _target_: torch.nn.Linear
+          in_features: 64
+          out_features: 32
+        - _target_: torch.nn.ELU
+        - _target_: torch.nn.Linear
+          in_features: 32
+          out_features: 1
+      _target_: legged_gym.rsl_rl.modules.ActorCritic
+      num_actor_obs: 106
+      num_critic_obs: 238
+      num_actions: 18
+      init_noise_std: 1.0
+    device: cuda:0
+    _target_: legged_gym.rsl_rl.algorithms.ppo.PPO
+    value_loss_coef: 1.0
+    use_clipped_value_loss: true
+    clip_param: 0.2
+    entropy_coef: 0.01
+    num_learning_epochs: 32
+    num_mini_batches: 4
+    learning_rate: 0.001
+    schedule: adaptive
+    gamma: 0.99
+    lam: 0.95
+    desired_kl: 0.01
+    max_grad_norm: 1.0
+    max_lr: 0.01
+    min_lr: 0.0001
+  _target_: legged_gym.rsl_rl.runners.on_policy_runner.OnPolicyRunner
+  ckpt_dir: ???
+  device: cuda:0
+  init_at_random_ep_len: true
+  num_transitions_per_env: 24
+  ckpt_save_interval: 500
+  max_iterations: 20000
+  num_eval_episode_per_env: 1
+  eval_freq: 500
+  vis_steps: 500
+  vis_freq: 10000
+  vis_resolution:
+  - 144
+  - 256
+ckpt_path: null
+use_noise: true
+git_hash: 8d02c7763670e737c0ed91e4bb37e7e376089ba7
+_convert_: all

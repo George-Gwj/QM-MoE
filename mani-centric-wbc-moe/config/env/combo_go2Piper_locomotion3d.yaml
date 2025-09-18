@@ -1,0 +1,24 @@
+defaults:
+  - env_go2Piper
+  - default_constraints
+  - tasks@tasks.locomotion: local_3d_vel
+  - _self_
+
+cfg:
+  env:
+    num_observations: 66
+    num_privileged_obs: 145
+tasks:
+  locomotion:
+    feet_sensor_indices:
+      - 0
+      - 1
+      - 2
+      - 3
+constraints:
+  action_rate:
+    penalty_weight: -0.02
+  feet_drag:
+    penalty_weight: -0.01
+  energy:
+    penalty_weight: -1e-6

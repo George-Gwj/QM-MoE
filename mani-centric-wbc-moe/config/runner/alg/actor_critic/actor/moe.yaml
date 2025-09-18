@@ -1,0 +1,49 @@
+# MoE Actor配置
+# 这个配置定义了混合专家模型中的actor部分
+
+# 基础专家actor配置
+base_actor:
+  _target_: torch.nn.Sequential
+  _args_:
+    - _target_: torch.nn.Linear
+      in_features: ${.....num_actor_obs}
+      out_features: 128
+    - _target_: torch.nn.ELU
+    - _target_: torch.nn.Linear
+      in_features: 128
+      out_features: 64
+    - _target_: torch.nn.ELU
+    - _target_: torch.nn.Linear
+      in_features: 64
+      out_features: 32
+    - _target_: torch.nn.ELU
+    - _target_: torch.nn.Linear
+      in_features: 32
+      out_features: ${.....num_actions}
+
+# 手臂专家actor配置
+arm_actor:
+  _target_: torch.nn.Sequential
+  _args_:
+    - _target_: torch.nn.Linear
+      in_features: ${.....num_actor_obs}
+      out_features: 128
+    - _target_: torch.nn.ELU
+    - _target_: torch.nn.Linear
+      in_features: 128
+      out_features: 64
+    - _target_: torch.nn.ELU
+    - _target_: torch.nn.Linear
+      in_features: 64
+      out_features: 32
+    - _target_: torch.nn.ELU
+    - _target_: torch.nn.Linear
+      in_features: 32
+      out_features: ${.....num_actions}
+
+# MoE权重网络配置
+obs_moe:
+  _target_: legged_gym.rsl_rl.modules.obs_moe.ObsMoE
+  obs_dim: ${.....num_actor_obs}
+  hidden_dims: [128, 64]
+  num_experts: 2 

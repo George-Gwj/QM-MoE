@@ -1,0 +1,48 @@
+defaults:
+  - actor_critic/actor: moe
+  - actor_critic/critic: moe
+
+device: ${..device}
+_target_: legged_gym.rsl_rl.algorithms.ppo_moe.PPOMoE
+value_loss_coef: 1.0
+use_clipped_value_loss: true
+clip_param: 0.2
+entropy_coef: 0.001
+num_learning_epochs: 32
+num_mini_batches: 4
+learning_rate: 0.001
+schedule: "adaptive"
+gamma: 0.9
+lam: 0.95
+desired_kl: 0.01
+max_grad_norm: 1.0
+max_lr: 1e-2
+min_lr: 0.0001
+moe_weight_regularization: 0.01  # MoE权重正则化系数
+
+# ActorCriticMoE配置 - 作为actor_critic参数传递
+actor_critic:
+  _target_: legged_gym.rsl_rl.modules.actor_critic_moe.ActorCriticMoE
+  num_actions: ???
+  freeze_experts: true
+  base_ckpt_path: null  # 基础专家模型权重路径
+  arm_ckpt_path: null   # 手臂专家模型权重路径
+  
+  # 基础专家ActorCritic
+  base_actor_critic:
+    _target_: legged_gym.rsl_rl.modules.ActorCritic
+    num_actions: ${..num_actions}
+    init_noise_std: 1.0
+    actor: ${..base_actor}
+    critic: ${..base_critic}
+  
+  # 手臂专家ActorCritic  
+  arm_actor_critic:
+    _target_: legged_gym.rsl_rl.modules.ActorCritic
+    num_actions: ${..num_actions}
+    init_noise_std: 1.0
+    actor: ${..arm_actor}
+    critic: ${..arm_critic}
+  
+  # MoE权重网络
+  obs_moe: ${..obs_moe} 
