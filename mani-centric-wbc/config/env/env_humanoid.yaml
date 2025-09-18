@@ -1,0 +1,418 @@
+defaults:
+  - env_base
+  - obs@state_obs: quadruped_state
+  - obs@privileged_state_obs: quadruped_privileged_state
+  - obs@privileged_setup_obs: quadruped_privileged_setup
+  - _self_
+
+# 覆盖环境类，使用包含新增观测的版本
+_target_: legged_gym.env.isaacgym.env_add_baseinfo.IsaacGymEnv
+
+ctrl_delay:
+  _convert_: all
+  _target_: torch.tensor
+  data:
+  # 左腿 (6个关节)
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+  # 右腿 (6个关节)
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+  # 躯干 (3个关节)
+   - 0.020
+   - 0.020
+   - 0.020
+  # 左臂 (6个关节)
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+  # 右臂 (6个关节)
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+  device: ${..sim_device}
+
+controller:
+  _target_: legged_gym.env.isaacgym.control.PositionController
+  scale:
+    _target_: torch.tensor
+    data:
+      # 左腿
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      # 右腿
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      # 躯干
+      - 0.25
+      - 0.25
+      - 0.25
+      # 左臂
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      # 右臂
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+  kp:
+    _target_: torch.tensor
+    data:
+      # 左腿
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      # 右腿
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      - 40.0
+      # 躯干
+      - 30.0
+      - 30.0
+      - 30.0
+      # 左臂
+      - 100.0
+      - 100.0
+      - 100.0
+      - 20.0
+      - 20.0
+      - 5.0
+      # 右臂
+      - 100.0
+      - 100.0
+      - 100.0
+      - 20.0
+      - 20.0
+      - 5.0
+  kd:
+    _target_: torch.tensor
+    data:
+      # 左腿
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      # 右腿
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      # 躯干
+      - 1.0
+      - 1.0
+      - 1.0
+      # 左臂
+      - 3.0
+      - 3.0
+      - 3.0
+      - 2.0
+      - 1.0
+      - 0.5
+      # 右臂
+      - 3.0
+      - 3.0
+      - 3.0
+      - 2.0
+      - 1.0
+      - 0.5
+  offset:
+    data:
+      # 左腿 - 站立姿态
+      - 0.0  # 髋关节外展
+      - 0.0  # 髋关节屈伸
+      - 0.0  # 髋关节内旋
+      - 0.0  # 膝关节
+      - 0.0  # 踝关节背屈
+      - 0.0  # 踝关节内翻
+      # 右腿 - 站立姿态
+      - 0.0  # 髋关节外展
+      - 0.0  # 髋关节屈伸
+      - 0.0  # 髋关节内旋
+      - 0.0  # 膝关节
+      - 0.0  # 踝关节背屈
+      - 0.0  # 踝关节内翻
+      # 躯干
+      - 0.0  # 腰部侧弯
+      - 0.0  # 腰部前屈
+      - 0.0  # 腰部旋转
+      # 左臂 - 自然下垂
+      - 0.0  # 肩关节外展
+      - 0.0  # 肩关节屈伸
+      - 0.0  # 肩关节内旋
+      - 0.0  # 肘关节
+      - 0.0  # 腕关节屈伸
+      - 0.0  # 腕关节内翻
+      # 右臂 - 自然下垂
+      - 0.0  # 肩关节外展
+      - 0.0  # 肩关节屈伸
+      - 0.0  # 肩关节内旋
+      - 0.0  # 肘关节
+      - 0.0  # 腕关节屈伸
+      - 0.0  # 腕关节内翻
+  torque_limit:
+    data:
+      # 左腿
+      - 20.0
+      - 20.0
+      - 20.0
+      - 35.0
+      - 15.0
+      - 15.0
+      # 右腿
+      - 20.0
+      - 20.0
+      - 20.0
+      - 35.0
+      - 15.0
+      - 15.0
+      # 躯干
+      - 15.0
+      - 15.0
+      - 15.0
+      # 左臂
+      - 20.0
+      - 20.0
+      - 15.0
+      - 7.0
+      - 5.0
+      - 5.0
+      # 右臂
+      - 20.0
+      - 20.0
+      - 15.0
+      - 7.0
+      - 5.0
+      - 5.0
+
+cfg:
+  env:
+    num_actions: 33  # 27个关节 (6+6+3+6+6)
+    num_observations: ???
+
+  init_state:
+    pos:
+      - 0.0
+      - 0.0
+      - 1.0  # 人型机器人通常更高
+
+  asset:
+    name: humanoid
+    file: "{LEGGED_GYM_ROOT_DIR}/resources/robots/humanoid/urdf/humanoid.urdf"
+    terminate_after_contacts_on:
+      - base
+      - hip
+      - Head
+      - torso
+      - left_shoulder
+      - right_shoulder
+      - left_elbow
+      - right_elbow
+      - left_wrist
+      - right_wrist
+    self_collisions: 0
+    collapse_fixed_joints: true
+    flip_visual_attachments: false
+    force_sensor_links:
+      - left_foot
+      - right_foot
+      - left_hand
+      - right_hand
+
+  domain_rand:
+    randomize_rigid_body_masses:
+      - base
+      - torso
+    added_mass_range:
+      - -2.0
+      - 2.0
+
+constraints:
+  joint_limit:
+    joint_names:
+      # 左腿
+      - left_hip_abduction_joint
+      - left_hip_flexion_joint
+      - left_hip_rotation_joint
+      - left_knee_joint
+      - left_ankle_dorsiflexion_joint
+      - left_ankle_inversion_joint
+      # 右腿
+      - right_hip_abduction_joint
+      - right_hip_flexion_joint
+      - right_hip_rotation_joint
+      - right_knee_joint
+      - right_ankle_dorsiflexion_joint
+      - right_ankle_inversion_joint
+      # 躯干
+      - lumbar_lateral_bending_joint
+      - lumbar_flexion_joint
+      - lumbar_rotation_joint
+      # 左臂
+      - left_shoulder_abduction_joint
+      - left_shoulder_flexion_joint
+      - left_shoulder_rotation_joint
+      - left_elbow_joint
+      - left_wrist_flexion_joint
+      - left_wrist_inversion_joint
+      # 右臂
+      - right_shoulder_abduction_joint
+      - right_shoulder_flexion_joint
+      - right_shoulder_rotation_joint
+      - right_elbow_joint
+      - right_wrist_flexion_joint
+      - right_wrist_inversion_joint
+    lower:
+      data:
+        # 左腿
+        - -0.5  # 髋关节外展
+        - -1.0  # 髋关节屈伸
+        - -0.5  # 髋关节内旋
+        - -0.5  # 膝关节
+        - -0.5  # 踝关节背屈
+        - -0.5  # 踝关节内翻
+        # 右腿
+        - -0.5  # 髋关节外展
+        - -1.0  # 髋关节屈伸
+        - -0.5  # 髋关节内旋
+        - -0.5  # 膝关节
+        - -0.5  # 踝关节背屈
+        - -0.5  # 踝关节内翻
+        # 躯干
+        - -0.5  # 腰部侧弯
+        - -0.5  # 腰部前屈
+        - -0.5  # 腰部旋转
+        # 左臂
+        - -1.5  # 肩关节外展
+        - -1.5  # 肩关节屈伸
+        - -1.5  # 肩关节内旋
+        - -1.0  # 肘关节
+        - -0.5  # 腕关节屈伸
+        - -0.5  # 腕关节内翻
+        # 右臂
+        - -1.5  # 肩关节外展
+        - -1.5  # 肩关节屈伸
+        - -1.5  # 肩关节内旋
+        - -1.0  # 肘关节
+        - -0.5  # 腕关节屈伸
+        - -0.5  # 腕关节内翻
+    upper:
+      data:
+        # 左腿
+        - 0.5   # 髋关节外展
+        - 1.0   # 髋关节屈伸
+        - 0.5   # 髋关节内旋
+        - 0.5   # 膝关节
+        - 0.5   # 踝关节背屈
+        - 0.5   # 踝关节内翻
+        # 右腿
+        - 0.5   # 髋关节外展
+        - 1.0   # 髋关节屈伸
+        - 0.5   # 髋关节内旋
+        - 0.5   # 膝关节
+        - 0.5   # 踝关节背屈
+        - 0.5   # 踝关节内翻
+        # 躯干
+        - 0.5   # 腰部侧弯
+        - 0.5   # 腰部前屈
+        - 0.5   # 腰部旋转
+        # 左臂
+        - 1.5   # 肩关节外展
+        - 1.5   # 肩关节屈伸
+        - 1.5   # 肩关节内旋
+        - 1.0   # 肘关节
+        - 0.5   # 腕关节屈伸
+        - 0.5   # 腕关节内翻
+        # 右臂
+        - 1.5   # 肩关节外展
+        - 1.5   # 肩关节屈伸
+        - 1.5   # 肩关节内旋
+        - 1.0   # 肘关节
+        - 0.5   # 腕关节屈伸
+        - 0.5   # 腕关节内翻
+  collision:
+    link_names:
+      - base
+      - torso
+      - left_thigh
+      - left_calf
+      - left_foot
+      - right_thigh
+      - right_calf
+      - right_foot
+      - left_upper_arm
+      - left_forearm
+      - left_hand
+      - right_upper_arm
+      - right_forearm
+      - right_hand
+  close_to_default:
+    default_config:
+      _target_: torch.tensor
+      data: ${....controller.offset.data}
+      device: ${....sim_device}
+  feet_drag:
+    feet_rigid_body_indices:
+      - 4  # 左脚
+      - 7  # 右脚
+  torque:
+    violation_torque: 5.0
+  energy:
+    violation_energy: 100.0
+  even_leg_usage:
+    violation_leg_usage: 0.5
+  even_mass_distribution:
+    violation_mass_distribution: 0.3
+  foot_contact_force:
+    violation_contact_force: 50.0
+  joint_acc:
+    violation_joint_acc: 10.0
+  joint_vel:
+    violation_joint_vel: 5.0
+  action_rate:
+    violation_action_rate: 2.0
+  keep_links_close:
+    violation_link_distance: 0.1
+  planar_pose:
+    violation_planar_pose: 0.1
+  point_body_at_gripper:
+    violation_point_body: 0.1
+  root_height:
+    violation_root_height: 0.1 

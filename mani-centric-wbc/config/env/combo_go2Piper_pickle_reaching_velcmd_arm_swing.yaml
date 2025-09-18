@@ -1,0 +1,4 @@
+defaults:
+  - combo_go2Piper_reaching_velcmd_arm_swing
+  - tasks/sequence_sampler@tasks.reaching.sequence_sampler: pickle_pose_loader
+  - _self_

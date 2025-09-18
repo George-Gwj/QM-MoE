@@ -1,0 +1,303 @@
+defaults:
+  - env_go2Piper_velcmd_arm_swing
+  - tasks@tasks.reaching: world_pos_reaching
+  - tasks@tasks.locomotion: locomotion6d
+  - constraints@constraints.action_rate: action_rate
+  - constraints@constraints.joint_acc: joint_acc
+  - constraints@constraints.collision: collision
+  - constraints@constraints.joint_limit: joint_limit
+  - constraints@constraints.torque: torque
+  - _self_
+
+# 覆盖环境类，使用支持课程学习的环境
+_target_: legged_gym.env.isaacgym.env_add_baseinfo.IsaacGymEnv
+
+ctrl_delay:
+  data:
+  # quadruped
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+   - 0.020
+
+state_obs:
+  dof_pos:
+    dim: 18
+  dof_vel:
+    dim: 18
+privileged_state_obs:
+  dof_pos:
+    dim: 18
+  dof_vel:
+    dim: 18
+
+tasks:
+  reaching:
+    link_name: end_effector
+    pos_reward_scale: 0.0
+    orn_reward_scale: 0.0
+    pose_reward_scale: 0.0
+    sequence_sampler:
+      episode_length_s: ${....cfg.env.episode_length_s}
+      dt: ${....cfg.sim.dt}
+      device: ${....sim_device}
+  locomotion:
+    feet_sensor_indices:
+      - 0
+      - 1
+      - 2
+      - 3
+    z_height_range:
+      - 0.2
+      - 0.3
+    lin_vel_range:
+      - - -0.5
+        - 0.5
+      - - -0.5
+        - 0.5
+      - - 0.0
+        - 0.0
+    ang_vel_range:
+      - - 0.0
+        - 0.0
+      - - 0.0
+        - 0.0
+      - - -1.0
+        - 1.0
+    roll_range:
+      - -0.1
+      - 0.1
+    pitch_range:
+      - -0.1
+      - 0.1
+    lin_vel_reward_scale: 3.0
+    ang_vel_reward_scale: 1.5
+
+constraints:
+  calves_torque:
+    violation_torque: 40.0
+    joint_names:
+      - FR_calf_joint
+      - FL_calf_joint
+      - RR_calf_joint
+      - RL_calf_joint
+    penalty_weight: -1e-3
+  torque:
+    violation_torque: 40.0
+    penalty_weight: -1e-4
+    power: 2
+  action_rate:
+    penalty_weight: -0.02
+    joint_names:
+      - FL_hip_joint
+      - FL_thigh_joint
+      - FL_calf_joint
+      - FR_hip_joint
+      - FR_thigh_joint
+      - FR_calf_joint
+      - RL_hip_joint
+      - RL_thigh_joint
+      - RL_calf_joint
+      - RR_hip_joint
+      - RR_thigh_joint
+      - RR_calf_joint
+  even_leg_usage:
+    leg_joint_sets:
+      FR:
+        - FR_hip_joint
+        - FR_thigh_joint
+        - FR_calf_joint
+      FL:
+        - FL_hip_joint
+        - FL_thigh_joint
+        - FL_calf_joint
+      RR:
+        - RR_hip_joint
+        - RR_thigh_joint
+        - RR_calf_joint
+      RL:
+        - RL_hip_joint
+        - RL_thigh_joint
+        - RL_calf_joint
+
+cfg:
+  env:
+    num_actions: 12
+    num_observations:  ${eval:"61 + len(${env.tasks.reaching.target_obs_times})*9"}
+    num_privileged_obs: 146
+
+  # 课程学习配置
+  curriculum:
+    curriculum_stage: 0
+    curriculum_transition_steps: 100000  # 每10万步进阶一次
+    performance_based_curriculum: true  # 使用基于性能的课程学习
+    curriculum_eval_freq: 50000  # 每2000步评估一次性能
+    curriculum_eval_episodes: 30  # 评估最近20个episode的平均性能
+    min_stable_steps: 100000  # 需要稳定10000步才能进阶
+    
+    # 性能阈值
+    lin_vel_tracking_error_threshold: 0.1      # 线性速度跟踪误差阈值
+    ang_vel_tracking_error_threshold: 0.1      # 角速度跟踪误差阈值
+
+  asset:
+    terminate_after_contacts_on:
+      - base
+      - hip
+      - Head
+      - thigh
+      - base_arm_link
+      - link1
+      - link2
+      - link3
+      - link4
+      - link5
+  sim:
+    substeps: 1
+    physx:
+      max_gpu_contact_pairs: 16777216
+      default_buffer_size_multiplier: 4
+      num_position_iterations: 4
+      num_velocity_iterations: 0
+      contact_collection: 1
+
+privileged_setup_obs:
+  rigid_shape_friction:
+    _target_: legged_gym.env.isaacgym.obs.EnvSetupAttribute
+    key: rigid_shape_friction
+    dim: 37
+    scale: 1.0
+    noise_std: null
+    clip: 100.0
+    offset: null
+
+controller:
+  _target_: legged_gym.env.isaacgym.control.PositionControllerWithExtraActionSampler
+  control_dim: 18  # 总共18个关节（12个四足 + 6个机械臂）
+  target_bounds:
+    _target_: torch.tensor
+    data:
+      # ARX5机械臂关节的上下界 [下界, 上界] - 固定范围，不进行课程学习
+      - [-2.68, 0.0, -2.697, -1.832, -1.22, -3.14]  # 下界
+      - [2.68, 3.14, 0, 1.832, 1.22, 3.14]  # 上界
+  time_per_target: 2.0  # 每个目标持续2秒
+  sim_dt: 0.005 # 仿真时间步长
+  seed: ${seed}  # 随机种子
+  scale:
+    _target_: torch.tensor
+    data:
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+        #
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+      - 0.25
+  kp:
+    _target_: torch.tensor
+    data:
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+      - 60.0
+        #
+      - 40.0
+      - 40.0
+      - 40.0
+      - 20.0
+      - 20.0
+      - 5.0
+  kd:
+    _target_: torch.tensor
+    data:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+      - 3.0
+      - 2.0
+      - 1.0
+      - 0.5
+  offset:
+    _target_: torch.tensor
+    data:
+      # Front Right
+      - 0.1 # hip
+      - 0.8 # thigh
+      - -1.5 # calf
+      # Front Left
+      - -0.1 # hip
+      - 0.8 # thigh
+      - -1.5 # calf
+      # Back Right
+      - 0.1 # hip
+      - 1.0 # thigh
+      - -1.5 # calf
+      # Back Left
+      - -0.1 # hip
+      - 1.0 # thigh
+      - -1.5 # calf
+      # Arm
+      - 0.0
+      - 0.5
+      - -0.5
+      - 0.0
+      - 0.0
+      - 0.0
+  torque_limit:
+    data:
+      - 23.7
+      - 23.7
+      - 35.5
+      - 23.7
+      - 23.7
+      - 35.5
+      - 23.7
+      - 23.7
+      - 35.5
+      - 23.7
+      - 23.7
+      - 35.5
+      - 20.0
+      - 20.0
+      - 15.0
+      - 7.0
+      - 5.0
+      - 5.0

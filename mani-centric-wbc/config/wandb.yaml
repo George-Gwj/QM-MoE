@@ -1,0 +1,7 @@
+wandb:
+  project: quadruped_manipulation
+  tags: null
+  group: null
+  resume: false
+  mode: offline
+
