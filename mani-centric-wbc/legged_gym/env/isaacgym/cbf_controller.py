@@ -14,7 +14,7 @@ class IsaacGymCBF:
         T_step: float = 0.01,
         h_threshold: float = 0.08,
         CBF_mode: str = '00',
-        use_statistic_obstacle: bool = True,
+        use_statistic_obstacle: bool = False,
         **kwargs
     ):
         self.num_envs = num_envs

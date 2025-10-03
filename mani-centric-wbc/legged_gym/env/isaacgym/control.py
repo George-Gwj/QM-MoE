@@ -91,8 +91,6 @@ class PDController:
         action: (num_envs, control_dim) from the network
         """
         # position control，需要offset量
-        print("self.offset",self.offset)
-        print("action",action)
         return self.compute_torque(
             normalized_action=action * self.scale
             + self.offset.repeat(action.shape[0], 1),
@@ -147,11 +145,94 @@ class PositionController(PDController):
         curr_vel = state.dof_vel.clone()
         assert normalized_action.shape == curr_pos.shape
         assert curr_vel.shape == curr_pos.shape
+
         if normalized_action.shape[0] != self.kp.shape[0]:
             self.kp = self.kp.repeat(normalized_action.shape[0], 1)
             self.kd = self.kd.repeat(normalized_action.shape[0], 1)
         torques = self.kp * (normalized_action - curr_pos) - self.kd * curr_vel
         return super().compute_torque(torques, state)
+
+
+class PositionVelocityController(PDController):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.arm_kp = torch.full_like(self.kp[..., 12:], 20.0, device=self.device)
+        self.arm_kp[..., 3] = 1.0
+        self.arm_kd = torch.full_like(self.kd[..., 12:], 0.1, device=self.device)
+        self.prev_velocity_error = torch.zeros_like(self.kd[..., 12:], device=self.device) 
+    def compute_torque(
+        self,
+        normalized_action: torch.Tensor,
+        state: EnvState,
+    ):
+        curr_pos = state.dof_pos.clone()
+        curr_vel = state.dof_vel.clone()
+        assert normalized_action.shape == curr_pos.shape
+        assert curr_vel.shape == curr_pos.shape
+        if normalized_action.shape[0] != self.kp.shape[0]:
+            self.kp = self.kp.repeat(normalized_action.shape[0], 1)
+            self.kd = self.kd.repeat(normalized_action.shape[0], 1)
+
+        
+        # 先根据机械臂的期望位置和实际位置，转换成期望速度
+        target_arm_vel = self.kp[..., 12:] * (normalized_action[..., 12:] - curr_pos[..., 12:]) - self.kd[..., 12:] * curr_vel[..., 12:]
+        # 再根据机械臂的期望速度和实际速度，转换成期望力矩
+        dt = state.sim_dt
+        current_velocity_error = target_arm_vel - curr_vel[..., 12:]
+        arm_torques = self.arm_kp * current_velocity_error + self.arm_kd * (current_velocity_error - self.prev_velocity_error)
+        self.prev_velocity_error = current_velocity_error
+        # 合并腿部的力矩和机械臂的力矩
+        torques = self.kp * (normalized_action - curr_pos) - self.kd * curr_vel
+        leg_arm_torques = torch.cat((torques[..., :12], arm_torques), dim=1)
+
+        # print("torques",torques)
+        # print("arm_torques",arm_torques)
+        # print("leg_arm_torques",leg_arm_torques)
+
+        return super().compute_torque(leg_arm_torques, state)
+
+# class PositionVelocityController(PDController):
+#     def __init__(self, **kwargs):
+#         super().__init__(**kwargs)
+#         self.arm_kp = torch.full_like(self.kp[..., 12:], 10.0, device=self.device)
+#         self.arm_kd = torch.full_like(self.kd[..., 12:], 0.1, device=self.device)
+#         self.prev_velocity_error = torch.zeros_like(self.kd[..., 12:], device=self.device) 
+#         self.tau = 1.0 / (2 * np.pi * 80)
+#         self.diff_filt = torch.zeros_like(self.kd[..., 12:], device=self.device)
+#         self.prev_velocity_error = torch.zeros_like(self.kd[..., 12:], device=self.device)
+#     def compute_torque(
+#         self,
+#         normalized_action: torch.Tensor,
+#         state: EnvState,
+#     ):
+#         curr_pos = state.dof_pos.clone()
+#         curr_vel = state.dof_vel.clone()
+#         assert normalized_action.shape == curr_pos.shape
+#         assert curr_vel.shape == curr_pos.shape
+#         if normalized_action.shape[0] != self.kp.shape[0]:
+#             self.kp = self.kp.repeat(normalized_action.shape[0], 1)
+#             self.kd = self.kd.repeat(normalized_action.shape[0], 1)
+
+        
+#         # 先根据机械臂的期望位置和实际位置，转换成期望速度
+#         target_arm_vel = self.kp[..., 12:] * (normalized_action[..., 12:] - curr_pos[..., 12:]) - self.kd[..., 12:] * curr_vel[..., 12:]
+#         # 再根据机械臂的期望速度和实际速度，转换成期望力矩
+#         dt = state.sim_dt
+#         beta = dt / (self.tau + dt)
+#         current_velocity_error = target_arm_vel - curr_vel[..., 12:]
+#         diff_raw = (current_velocity_error - self.prev_velocity_error) / dt
+#         self.diff_filt = self.diff_filt + (diff_raw - self.diff_filt) * beta
+#         arm_torques = self.arm_kp * current_velocity_error + self.arm_kd * self.diff_filt
+#         self.prev_velocity_error = current_velocity_error
+#         # 合并腿部的力矩和机械臂的力矩
+#         torques = self.kp * (normalized_action - curr_pos) - self.kd * curr_vel
+#         leg_arm_torques = torch.cat((torques[..., :12], arm_torques), dim=1)
+
+#         # print("torques",torques)
+#         print("arm_torques",arm_torques)
+#         # print("leg_arm_torques",leg_arm_torques)
+
+#         return super().compute_torque(leg_arm_torques, state)
 
 
 class PositionControllerWithExtraFixedAction(PositionController):
@@ -171,6 +252,38 @@ class PositionControllerWithExtraFixedAction(PositionController):
             (
                 action,
                 self.extra_action[None, :].repeat(action.shape[0], 1),
+            ),
+            dim=1,
+        )
+        return super().__call__(action, state)
+
+
+class PositionControllerCbf(PositionController):
+    def __init__(
+        self,
+        target_bounds: torch.Tensor,
+        time_per_target: float,
+        seed: int,
+        sim_dt: float,
+        clip_curriculum: Optional[Dict[int, torch.Tensor]] = None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+
+    def __call__(
+        self,
+        action: torch.Tensor,
+        state: EnvState,
+    ):
+        extra_action = torch.tensor([[0.0,2.3,-1.5,0.0,0.0,0.0]], device=self.device)
+        """
+        action: (num_envs, control_dim) from the network
+        """
+
+        action = torch.cat(
+            (
+                action,
+                extra_action,
             ),
             dim=1,
         )
@@ -233,6 +346,93 @@ class PositionControllerWithExtraActionList(PositionController):
             dim=1,
         )
         return super().__call__(action, state)
+
+class PositionVelocityControllerWithExtraActionSampler(PositionVelocityController):
+    def __init__(
+        self,
+        target_bounds: torch.Tensor,
+        time_per_target: float,
+        seed: int,
+        sim_dt: float,
+        clip_curriculum: Optional[Dict[int, torch.Tensor]] = None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.target_bounds = target_bounds.to(self.device)
+        self.generator = torch.Generator(device=self.device)
+        self.generator.manual_seed(seed)
+        self.steps_per_target = int(np.rint(time_per_target / sim_dt))
+        self.step_counter = 0
+        self.curriculum_steps = None
+        if clip_curriculum is not None:
+            self.curriculum_steps = sorted(clip_curriculum.keys())
+            self.curriculum_clip_values = torch.stack(
+                [clip_curriculum[step] for step in self.curriculum_steps]
+            ).to(self.device)
+            assert self.curriculum_clip_values.shape == (
+                len(self.curriculum_steps),
+                2,
+                self.extra_ctrl_dim,
+            )
+        self.prev_targets = self.sample_joints()
+        self.next_targets = self.sample_joints()
+
+    def sample_joints(self):
+        joints = (
+            torch.rand(
+                (self.num_envs, self.extra_ctrl_dim),
+                device=self.device,
+                generator=self.generator,
+            )
+            * (self.target_bounds[None, 1] - self.target_bounds[None, 0])
+            + self.target_bounds[None, 0]
+        )
+        if self.curriculum_steps is not None:
+            curriculum_level = self.curriculum_steps[
+                max(
+                    0,
+                    np.searchsorted(
+                        self.curriculum_steps, self.step_counter, side="left"
+                    )
+                    - 1,
+                )
+            ]
+            joints = torch.clip(
+                joints,
+                min=self.curriculum_clip_values[curriculum_level, 0],
+                max=self.curriculum_clip_values[curriculum_level, 1],
+            )
+        return joints
+
+    @property
+    def extra_ctrl_dim(self) -> int:
+        return self.target_bounds.shape[1]
+
+    def get_current_target(self):
+        alpha = (self.step_counter % self.steps_per_target) / self.steps_per_target
+        return self.prev_targets * (1 - alpha) + self.next_targets * alpha
+
+    def __call__(
+        self,
+        action: torch.Tensor,
+        state: EnvState,
+    ):
+        """
+        action: (num_envs, control_dim) from the network
+        """
+        if self.step_counter % self.steps_per_target == 0:
+            self.prev_targets = self.next_targets
+            self.next_targets = self.sample_joints()
+        target = self.get_current_target()
+        # # 保持 init 状态 
+        # target = torch.zeros_like(target)
+        action = torch.cat(
+            (action, target),
+            dim=1,
+        )
+        self.step_counter += 1
+        return super().__call__(action, state)
+
 
 
 class PositionControllerWithExtraActionSampler(PositionController):

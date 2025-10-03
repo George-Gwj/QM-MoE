@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from typing import Callable, Dict, List, Optional, Tuple, Union
+import time
 
 import numpy as np
 import pytorch3d.transforms as p3d
@@ -15,9 +16,9 @@ from isaacgym.torch_utils import quat_mul, to_torch
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.env.isaacgym.constraints import Constraint
 from legged_gym.env.isaacgym.control import Control, PDController
-from legged_gym.env.isaacgym.obs_origin import EnvObservationAttribute, EnvSetupAttribute
-from legged_gym.env.isaacgym.state_origin import EnvSetup, EnvState
-from legged_gym.env.isaacgym.task_origin import Task
+from legged_gym.env.isaacgym.obs import EnvObservationAttribute, EnvSetupAttribute
+from legged_gym.env.isaacgym.state import EnvSetup, EnvState
+from legged_gym.env.isaacgym.task import Task
 from legged_gym.env.isaacgym.terrain import TerrainPerlin
 from legged_gym.env.isaacgym.utils import quat_apply_yaw, torch_rand_float
 from legged_gym.env.obs import ObservationAttribute
@@ -25,6 +26,89 @@ from legged_gym.rsl_rl.env import VecEnv
 
 PartialTask = Callable[[gymapi.Gym, gymapi.Sim, str, torch.Generator], Task]
 PartialConstraint = Callable[[gymapi.Gym, gymapi.Sim, str, torch.Generator], Constraint]
+
+from cbf.cbf_controller import CBF_controller, DISTURBANCE_OBSERVER
+from multiprocessing import Process, Queue
+import casadi as ca
+
+
+class SuppressOutput:
+    """Context manager to suppress qpOASES output"""
+    def __enter__(self):
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout.close()
+        sys.stderr.close()
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+
+class PDController:
+    """通用PD控制器（比例-微分控制）"""
+    
+    def __init__(self, kp=1.0, kd=0.0, dt=0.01, output_limits=None):
+        """
+        Args:
+            kp: 比例增益
+            kd: 微分增益
+            dt: 时间步长
+            output_limits: 输出限制 (min, max)
+        """
+        self.kp = kp
+        self.kd = kd
+        self.output_limits = output_limits
+        
+        # 内部状态
+        self.previous_error = 0.0
+        self.previous_output = 0.0
+        
+    def update(self, setpoint, current_value):
+        """
+        更新PD控制器
+        
+        Args:
+            setpoint: 目标值
+            current_value: 当前值
+            
+        Returns:
+            control_output: 控制输出
+        """
+        # 计算误差
+        error = setpoint - current_value
+        
+        # 比例项
+        proportional = self.kp * error
+        
+        # 微分项
+        derivative = self.kd * (error - self.previous_error)
+        
+        # PD输出
+        output = proportional + derivative
+        
+        # 应用输出限制
+        if self.output_limits is not None:
+            output = max(self.output_limits[0], min(self.output_limits[1], output))
+        
+        # 更新内部状态
+        self.previous_error = error
+        self.previous_output = output
+        
+        return output
+    
+    def reset(self):
+        """重置控制器状态"""
+        self.previous_error = 0.0
+        self.previous_output = 0.0
+    
+    def set_params(self, kp=None, kd=None, dt=None):
+        """动态设置PD参数"""
+        if kp is not None:
+            self.kp = kp
+        if kd is not None:
+            self.kd = kd
 
 
 class IsaacGymEnv(VecEnv):
@@ -271,6 +355,475 @@ class IsaacGymEnv(VecEnv):
         )
         self.obs_history_len = obs_history_len
 
+        # 添加CBF相关的init
+        self.T_step = 0.005
+        self.O_T_step = 0.00085
+        self.obstacle_type_num = [0, 0, 3]
+        self.use_robust = True
+        self.use_dynamic = False
+        self.set_disturbance = False
+        self.para_v_fault = 1.0
+        
+        # Determine CBF mode
+        if self.use_robust and self.use_dynamic:
+            self.mode = '11'
+        elif self.use_robust and not self.use_dynamic:
+            self.mode = '10'
+        elif not self.use_robust and self.use_dynamic:
+            self.mode = '01'
+        else:
+            self.mode = '00'
+        
+        # CBF process setup
+        self.CBF_input = Queue(1)
+        self.CBF_output = Queue(1)
+        self.DOB_input = Queue(1)
+        self.DOB_output = Queue(1)
+        # Start CBF process (but don't start it yet, wait for CBF_start call)
+        self.CBF_process = Process(target=self.CBF_process_func, args=(self.CBF_input, self.CBF_output, self.DOB_input), daemon=True)
+        # Start disturbance observer process
+        self.DOB_process = Process(target=self.observer_process_func, args=(self.DOB_input, self.DOB_output), daemon=True)
+
+        # Initialize CBF controller
+        self.cbf_controller = CBF_controller(
+            obstacle_type_num=self.obstacle_type_num,
+            T_step=self.T_step,
+            CBF_mode=self.mode,
+            O_T_step=self.O_T_step,
+            use_statistic_obstacle = False
+        )
+
+        self.h_threshold = 0.05
+        self.h_list_min = 1.0
+        self.update_beta = False
+        self.velocity_limite = np.array([1, 1, 0.5, 0.2, 0.2, 1.0, 3.14, 3.40, 3.14, 3.93, 3.93])
+        
+        # CBF control configuration (11 DOF: 6 base + 5 arm)
+        self.u_len = 11  # go2-6dof velocity + piper-5dof velocity (same as MuJoCo)
+        self.base_dofs = 6  # x, y, z, roll, pitch, yaw
+        self.arm_controlled_dofs = 5  # 5 arm joints for velocity control
+        self.leg_dofs = 12
+
+        # 初始化PD控制器（只创建一次）
+        self.pd_controllers = []
+        velocity_output_limits = [
+            [-0.4, 0.4], [-0.4, 0.4], [-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5], [-1.0,1.0],
+            [-3.14, 3.14], [-3.40, 3.40], [-3.14, 3.14], [-3.93, 3.93], [-3.93, 3.93], [-3.93, 3.93]
+        ]
+        self.position_kp = np.array([2, 2, 2, 2, 2, 2, 
+                                    21.3016, 27.2393, 50.8360, 15.9196, 22.5215,  5.1744])  # 大幅降低所有手臂关节Kp
+        self.position_kd = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+                                    1.6801, 2.6524, 3.5458, 2.7676, 0.6234, 0.5672])  # 大幅降低所有手臂关节Kd
+
+        self.arm_vel_kp = np.array([8, 8, 8, 8, 8, 8])
+        self.arm_vel_kd = np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
+        self.prev_velocity_error = np.zeros(6)
+        for i in range(12):
+            self.pd_controllers.append(
+                PDController(kp=self.position_kp[i], kd=self.position_kd[i], output_limits=velocity_output_limits[i])
+            )
+        self.arm_velocity_pd_controllers = []
+        arm_torques_limits = [ [-20.0, 20.0], [-20.0, 20.0], [-15.0, 15.0], [-7.0, 7.0], [-5.0, 5.0], [-5.0, 5.0]]
+        for i in range(6):
+            self.arm_velocity_pd_controllers.append(
+                PDController(kp=self.arm_vel_kp[i], kd=self.arm_vel_kd[i], output_limits=arm_torques_limits[i])
+            )
+        self.current_joint_values = np.array([0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.5, -0.6, 0.0, 0.0])
+        self.current_joint_vel = np.zeros(11)
+        self.CBF_filter_velocity = np.zeros(11)
+        self.target_base_arm_vel = np.zeros(11)
+        self.r_arm = np.array([.036,.029,.029,.029,.029,.029,0.25])
+        self.x0,self.y0,self.rectangle_r  = self.caculate_rectangle_from_cuboid(0.5, 0.7, 0.05)
+        self.x1,self.y1,self.rectangle_r1  = self.caculate_rectangle_from_cuboid(0.5, 0.05, 0.6)
+        self.x2,self.y2,self.rectangle_r2  = self.caculate_rectangle_from_cuboid(0.5, 0.05, 0.6)       
+        self.r_safe_expand = 0.01
+        self.safe_R_list = np.array([
+            self.r_arm+self.rectangle_r+2.5*self.r_safe_expand,
+            self.r_arm+self.rectangle_r1+2.5*self.r_safe_expand,
+            self.r_arm+self.rectangle_r2+2.5*self.r_safe_expand,
+        ])
+        # 障碍物速度
+        self.obs_v = np.array([
+            [0.0,0.0,0.0],
+            [0.0,0.0,0.0],
+            [0.0,0.0,0.0],
+        ])
+        self.dt = None
+        self.h_list = np.array([0.0,0.0,0.0])
+        self.solve_time = []
+        self.ut = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+
+    def caculate_rectangle_from_cuboid(self,a,b,h):
+        arr = sorted([a, b, h], reverse=True)        
+        return arr[0]-arr[2]/np.sqrt(2),arr[1]-arr[2]/np.sqrt(2),arr[2]/np.sqrt(2) # arr : a b h
+
+
+    def CBF_start(self):
+        """Start CBF process with initial data - based on MuJoCo version"""
+        # Update obstacle data
+        obstacles = self.update_obstacle_data()
+        
+        # Get current joint values and velocities
+        self.target_base_arm_vel=self.update_base_arm_pos_pid()
+        current_base_arm_pos, current_base_arm_vel=self.update_joint_pos_vel()
+        
+        # Calculate obstacle velocities
+        obs_v = self.obs_v 
+        
+        # Use 11D state directly (6 base + 5 arm)
+        states_11 = current_base_arm_pos
+        states_vel_11 = current_base_arm_vel
+
+        # Prepare initial data for CBF process (same format as MuJoCo)
+        input_data = {
+            "obstacles": obstacles,  # Current obstacle positions
+            "target": self.target_base_arm_vel,  # Target velocities (11)
+            "current_group_joint_values": current_base_arm_pos,  # 11D state
+            "current_group_joint_vel": current_base_arm_vel,  # 11D state velocity
+            "safe_R_list": self.safe_R_list,  # Safe radii
+            "obs_v": obs_v,  # Obstacle velocities with fault parameter
+            "update_beta": True,  # Initialize beta
+            "obstacle_type_num": self.obstacle_type_num,
+            "T_step": self.T_step,
+            "O_T_step": self.O_T_step,  # Use same time step for observer
+            "h_threshold": self.h_threshold,
+            "CBF_mode": self.mode,
+            "out_limite": self.velocity_limite,  # Default output limit
+            "dt": self.dt
+        }
+        
+        # Send initial data and start CBF process
+        self.CBF_input.put(input_data)
+        self.CBF_process.start()
+
+    def CBF_process_func(self, in_queue, out_queue, DOB_input):
+        """CBF computation process - based on MuJoCo version"""
+        initialize_CBF = True
+        CBF_counter = 0
+        
+        # Wait for initial data
+        while in_queue.empty():
+            pass
+        initial_data = in_queue.get()
+        
+        # Extract initialization parameters
+        obstacle_type_num = initial_data["obstacle_type_num"]
+        T_step = initial_data["T_step"]
+        O_T_step = initial_data["O_T_step"]
+        h_threshold = initial_data["h_threshold"]
+        CBF_mode = initial_data["CBF_mode"]
+        out_limite = initial_data["out_limite"]
+        
+        # Initialize CBF controller
+        CBF_filter = CBF_controller(
+            obstacle_type_num=obstacle_type_num,
+            T_step=T_step,
+            O_T_step=O_T_step,
+            h_threshold=h_threshold,
+            out_limite=out_limite,
+            CBF_mode=CBF_mode
+        )
+        
+        def initial_beta(obstacles, current_group_joint_values, safe_R_list, obs_v, states_velocity):
+            """Initialize beta parameters for CBF"""
+            try:
+                h0_val = CBF_filter.caculate_barriers(
+                    current_group_joint_values, 
+                    obstacles[0],  # sphere obstacles
+                    obstacles[1],  # capsule obstacles  
+                    obstacles[2],  # rectangle obstacles
+                    safe_R_list, 
+                    obs_v, 
+                    states_velocity
+                )
+                h0 = h0_val.toarray()     
+                # Ensure h0 values are positive (avoid division by zero)
+                for i in range(len(h0)):
+                    if h0[i] <= 0:
+                        h0[i] = 0.0001
+                
+                # Calculate beta values
+                beta = (CBF_filter.w0 ** 2) / (2 * h0)
+                CBF_filter.set_beta(beta)
+                
+            except Exception as e:
+                print(f"Error in initial_beta: {e}")
+                # Set default beta values if calculation fails
+                default_beta = np.ones(len(obstacles[0]) + len(obstacles[1]) + len(obstacles[2])) * 0.1
+                CBF_filter.set_beta(default_beta)
+        
+        # Main CBF processing loop
+        while True:
+            if not in_queue.empty() or initialize_CBF:
+                start_time = time.time()
+                
+                # Reset counter periodically to prevent overflow
+                if CBF_counter > 20000:
+                    CBF_counter = 0
+                
+                if initialize_CBF:
+                    input_data = initial_data
+                    # Send initialization data to DOB
+
+                    O_T_step=CBF_filter.O_T_step
+                    alpha=CBF_filter.alpha
+                    f=ca.DM(CBF_filter.Ax).toarray()
+                    g1=ca.DM(CBF_filter.gx).toarray()
+                    g2=ca.DM(CBF_filter.g2).toarray()
+                    w0=CBF_filter.w0
+                    
+                    DOB_data = {
+                        "O_T_step": O_T_step,
+                        "alpha": alpha,
+                        "f": f,
+                        "g1": g1,
+                        "g2": g2,
+                        "w0": w0
+                    }
+                    DOB_input.put(DOB_data)
+                    initialize_CBF = False
+                else:
+                    input_data = in_queue.get()
+                
+                # Extract data from input
+                obstacles = input_data["obstacles"]
+                target = input_data["target"]
+                current_group_joint_values = input_data["current_group_joint_values"]
+                current_group_joint_vel = input_data["current_group_joint_vel"]
+                safe_R_list = input_data["safe_R_list"]
+                obs_v = input_data["obs_v"]
+                update_beta = input_data["update_beta"]
+                dt = input_data["dt"]
+                # Update beta if needed
+                if update_beta or CBF_counter == 0:
+                    initial_beta(obstacles, current_group_joint_values, safe_R_list, obs_v, current_group_joint_vel)
+                # Solve CBF-QP using solve_QP5 method
+
+                with SuppressOutput():
+                    CBF_filter_velocity, h_list = CBF_filter.solve_QP5(
+                        obstacles=obstacles,
+                        states_input=current_group_joint_values,
+                        states_velocity=current_group_joint_vel,
+                        u_input=target,
+                        safe_R_list=safe_R_list,
+                        obs_v=obs_v,
+                        dt=dt
+                    )
+                
+                process_once_time = time.time() - start_time
+                
+                # Send output data
+                output_data = {
+                    "CBF_filter_velocity": CBF_filter_velocity,
+                    "h_list": h_list,
+                    "process_once_time": process_once_time
+                }
+                out_queue.put(output_data)
+                CBF_counter += 1
+
+
+    def observer_process_func(self,DOB_input,DOB_output):
+        initialize_DOB = True
+        while DOB_input.empty() is True:
+            pass
+        Dob_initial_data = self.DOB_input.get()
+        O_T_step=Dob_initial_data["O_T_step"]
+        alpha=Dob_initial_data["alpha"]
+        f=Dob_initial_data["f"]
+        g1=Dob_initial_data["g1"]
+        g2=Dob_initial_data["g2"]
+        w0=Dob_initial_data["w0"]
+        Dob = DISTURBANCE_OBSERVER(O_T_step,alpha,f,g1,g2,w0)
+        cal_list = []
+        while True:
+            # s = time.time()
+            if DOB_input.empty() is False or initialize_DOB:
+                s = time.time()
+                if initialize_DOB:
+
+                    initialize_DOB = False
+                    out_data={"initialize_DOB":True}
+                else:
+                    in_data = DOB_input.get()
+                    currrent_state=in_data["currrent_state"]
+                    ut=in_data["ut"]
+                    dt=Dob.update_d(np.array(ut),currrent_state)
+                    out_data={"dt":dt}
+                DOB_output.put(out_data)
+                cal_list.append(time.time()-s)
+            if len(cal_list) > 100:
+                avg = sum(cal_list) / len(cal_list)
+                print("Dob avg =", avg)
+                cal_list = []
+
+    def observer_start(self):
+        while self.DOB_input.empty():
+            pass
+        self.DOB_process.start()
+
+    def update_joint_pos_vel(self):
+        """Update current joint values from simulation (11D: 6 base + 5 arm)"""
+        # Refresh DOF state tensor to get latest joint positions and velocities
+        self.gym.refresh_dof_state_tensor(self.sim)
+        
+        # Update base 6DOF position from robot base  
+        base_pos = self.state.root_pos[0].cpu().numpy()  # 第0个环境的位置
+        # 获取机器人基座四元数 (x, y, z, w)
+        base_quat = self.state.root_xyzw_quat[0].cpu().numpy()  # 第0个环境的四元数
+        
+        # 将四元数转换为欧拉角 (roll, pitch, yaw)
+        from scipy.spatial.transform import Rotation as R
+        r = R.from_quat(base_quat)
+        euler_angles = r.as_euler('xyz', degrees=False)
+        
+        # 组合位置和姿态为6DOF
+        base_6dof = np.concatenate([base_pos, euler_angles])
+
+        # 获取手臂关节位置和速度 (索引12-16，共5个DOF用于CBF控制)
+        arm_5dof_pos = self.state.dof_pos[0, self.leg_dofs:self.leg_dofs+self.arm_controlled_dofs].cpu().numpy()
+
+        # Update 11D joint values (6 base + 5 arm)
+        self.current_joint_values = np.concatenate([base_6dof, arm_5dof_pos])
+        
+        # For velocities, base velocities come from rigid body state
+        base_lin_vel = self.state.root_lin_vel[0].cpu().numpy()
+        base_ang_vel = self.state.root_ang_vel[0].cpu().numpy()
+        arm_5dof_vel = self.state.dof_vel[0, self.leg_dofs:self.leg_dofs+self.arm_controlled_dofs].cpu().numpy()
+        base_6dof_vel = np.concatenate([base_lin_vel, base_ang_vel])
+
+        self.current_joint_vel = np.concatenate([base_6dof_vel, arm_5dof_vel])
+
+        return self.current_joint_values, self.current_joint_vel
+
+    def update_obstacle_data(self):
+
+        """Update obstacle positions and velocities"""
+        # 将CUDA张量转换为CPU numpy数组
+        obstacles_pos = self.state.root_pos[1:4].cpu().numpy()
+        obstacles_vel = self.state.root_lin_vel[1:4].cpu().numpy()
+
+        rectangle_obstacle_input = np.array([[obstacles_pos[0][0],obstacles_pos[0][1],obstacles_pos[0][2],
+                                             obstacles_pos[0][0]-self.x0/2,obstacles_pos[0][1]+self.y0/2,obstacles_pos[0][2],
+                                             obstacles_pos[0][0]+self.x0/2,obstacles_pos[0][1]+self.y0/2,obstacles_pos[0][2],
+                                             obstacles_pos[0][0]-self.x0/2,obstacles_pos[0][1]-self.y0/2,obstacles_pos[0][2]],
+                                             [obstacles_pos[1][0],obstacles_pos[1][1],obstacles_pos[1][2],
+                                             obstacles_pos[1][0]-self.x1/2,obstacles_pos[1][1]+self.y1/2,obstacles_pos[1][2],
+                                             obstacles_pos[1][0]+self.x1/2,obstacles_pos[1][1]+self.y1/2,obstacles_pos[1][2],
+                                             obstacles_pos[1][0]-self.x1/2,obstacles_pos[1][1]-self.y1/2,obstacles_pos[1][2]],
+                                             [obstacles_pos[2][0],obstacles_pos[2][1],obstacles_pos[2][2],
+                                             obstacles_pos[2][0]-self.x2/2,obstacles_pos[2][1]+self.y2/2,obstacles_pos[2][2],
+                                             obstacles_pos[2][0]+self.x2/2,obstacles_pos[2][1]+self.y2/2,obstacles_pos[2][2],
+                                             obstacles_pos[2][0]-self.x2/2,obstacles_pos[2][1]-self.y2/2,obstacles_pos[2][2]],
+                                             ]) 
+
+        print("rectangle_obstacle_input",rectangle_obstacle_input)
+    
+        return [np.array([]),np.array([]),rectangle_obstacle_input]
+
+    def get_constraint_info(self, constraint_idx):
+        """解析约束索引对应的约束信息"""
+        # 根据CBF控制器的结构解析约束
+        # obstacle_type_num = [0, 0, 3] (sphere, capsule, rectangle)
+        # n_conpoment = 7 (机械臂组件数)
+        # n_base_cbf = 3 (基础CBF数量)
+        # n_statistic_cbf = 8 (统计CBF数量)
+        
+        sphere_num = self.obstacle_type_num[0]  # 0
+        capsule_num = self.obstacle_type_num[1]  # 0  
+        rectangle_num = self.obstacle_type_num[2]  # 3
+        n_conpoment = 7
+        n_base_cbf = 3
+        n_statistic_cbf = 8
+        
+        totle_num = sphere_num + capsule_num + rectangle_num  # 3
+        obstacle_constraints = totle_num * n_conpoment  # 3 * 7 = 21
+        
+        if constraint_idx < obstacle_constraints:
+            # 障碍物约束
+            obstacle_idx = constraint_idx // n_conpoment
+            component_idx = constraint_idx % n_conpoment
+            
+            if obstacle_idx < sphere_num:
+                obstacle_type = "sphere"
+                obstacle_id = obstacle_idx
+            elif obstacle_idx < sphere_num + capsule_num:
+                obstacle_type = "capsule" 
+                obstacle_id = obstacle_idx - sphere_num
+            else:
+                obstacle_type = "rectangle"
+                obstacle_id = obstacle_idx - sphere_num - capsule_num
+            
+            component_names = ["base", "link1", "link2", "link3", "link4", "link5", "link6"]
+            component_name = component_names[component_idx] if component_idx < len(component_names) else f"component_{component_idx}"
+            
+            return f"{obstacle_type}_{obstacle_id}_{component_name}"
+            
+        elif constraint_idx < obstacle_constraints + n_base_cbf:
+            # 基础CBF约束
+            base_idx = constraint_idx - obstacle_constraints
+            return f"base_cbf_{base_idx}"
+            
+        else:
+            # 统计CBF约束
+            stat_idx = constraint_idx - obstacle_constraints - n_base_cbf
+            return f"statistic_cbf_{stat_idx}"
+
+    def get_joint3_constraints(self):
+        """获取joint3相关的所有约束值"""
+        if not hasattr(self, 'h_list') or len(self.h_list) == 0:
+            return {}
+        
+        joint3_constraints = {}
+        
+        # obstacle_type_num = [0, 0, 3]
+        # n_conpoment = 7
+        # joint3对应component_idx = 2 (link2)
+        
+        sphere_num = self.obstacle_type_num[0]  # 0
+        capsule_num = self.obstacle_type_num[1]  # 0  
+        rectangle_num = self.obstacle_type_num[2]  # 3
+        n_conpoment = 7
+        
+        totle_num = sphere_num + capsule_num + rectangle_num  # 3
+        
+        # 查找所有joint3相关的约束
+        for obstacle_idx in range(totle_num):
+            constraint_idx = obstacle_idx * n_conpoment + 2  # joint3 = link2, component_idx = 2
+            if constraint_idx < len(self.h_list):
+                obstacle_type = "rectangle" if obstacle_idx >= sphere_num + capsule_num else "unknown"
+                obstacle_id = obstacle_idx - sphere_num - capsule_num if obstacle_idx >= sphere_num + capsule_num else obstacle_idx
+                constraint_name = f"{obstacle_type}_{obstacle_id}_link2"
+                joint3_constraints[constraint_name] = self.h_list[constraint_idx]
+        
+        return joint3_constraints
+
+    def update_base_arm_pos_pid(self):  
+        """Update base and arm positions using PD control"""
+        target_base_arm_joint = [7.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.5, -0.6, 0.0, 0.0, 0.0]
+        target_base_arm_vel = []
+        for i in range(11):
+            # base
+            if i < 6:
+                vel = self.pd_controllers[i].update(
+                    target_base_arm_joint[i], 
+                    self.current_joint_values[i]
+                )
+                target_base_arm_vel.append(vel)
+
+            # arm
+            if i >= 6:
+                vel = self.position_kp[i] * (target_base_arm_joint[i] - self.current_joint_values[i]) - self.position_kd[i] * self.current_joint_vel[i]
+                target_base_arm_vel.append(vel)
+
+        return np.array(target_base_arm_vel)
+
+
+
+
+
+
+
+
     @property
     def episode_step(self) -> torch.Tensor:
         return (self.state.episode_time / self.gym_dt).long()
@@ -347,7 +900,58 @@ class IsaacGymEnv(VecEnv):
             if vis is not None:
                 info["vis"] = vis
         decimation_count = self.controller.decimation_count
+        time_start = time.time()
         for decimation_step in range(decimation_count):
+
+
+            # CBF 
+            if self.CBF_output.empty() is False:
+                out_data=self.CBF_output.get()
+                CBF_filter_velocity=out_data["CBF_filter_velocity"]
+                self.h_list=out_data["h_list"]
+                process_once_time=out_data["process_once_time"]
+                CBF_filter_velocity=np.array(CBF_filter_velocity.toarray())
+                self.ut = CBF_filter_velocity.tolist()
+                self.CBF_filter_velocity = np.array(self.ut).reshape(len(self.ut))
+                self.h_list_min=self.h_list.min()
+                self.solve_time.append(process_once_time)
+                
+                # # 找到h_list_min对应的约束
+                # if hasattr(self, 'h_list') and len(self.h_list) > 0:
+                #     min_idx = np.argmin(self.h_list)
+                #     constraint_info = self.get_constraint_info(min_idx)
+                #     print(f"\n=== 最小约束信息 ===")
+                #     print(f"最小约束索引: {min_idx}")
+                #     print(f"约束信息: {constraint_info}")
+                #     print(f"约束值: {self.h_list[min_idx]:.6f}")
+                #     print("==================")
+
+            self.target_base_arm_vel=self.update_base_arm_pos_pid()
+            current_base_arm_pos, current_base_arm_vel=self.update_joint_pos_vel()
+
+            self.obstacles=self.update_obstacle_data()
+            
+            input_data={"obstacles":self.obstacles,
+            "target":self.target_base_arm_vel,
+            "current_group_joint_values":current_base_arm_pos,
+            "current_group_joint_vel":current_base_arm_vel,
+            "safe_R_list":self.safe_R_list,
+            "obs_v":self.obs_v*self.para_v_fault,
+            "update_beta":self.update_beta,
+            "dt":self.dt}
+            self.CBF_input.put(input_data)
+
+            if self.DOB_output.empty() is False:
+                DOB_out=self.DOB_output.get()
+                if "initialize_DOB" in DOB_out:
+                    pass
+                else:
+                    self.dt=DOB_out["dt"]
+                DOB_in={'currrent_state':current_base_arm_pos,'ut':self.ut}
+                self.DOB_input.put(DOB_in)
+
+
+
             callback(self) if callback is not None else None
             # handle delay by indexing into the buffer of past targets
             # since new actions are pushed to the front of the buffer,
@@ -365,6 +969,24 @@ class IsaacGymEnv(VecEnv):
                 ].permute(1, 0),
                 state=self.state,
             )
+            arm_torques = []
+            for i in range(5):
+                # 直接使用CBF输出的速度作为目标速度，计算速度误差
+                target_velocity = self.CBF_filter_velocity[i+6]
+                current_velocity = self.current_joint_vel[i+6]
+                velocity_error = target_velocity - current_velocity
+                
+                # 简化的速度控制：只使用比例项
+                torque = self.arm_vel_kp[i] * velocity_error
+                arm_torques.append(torque)
+                
+            # Convert list to tensor and replace elements 13-17 (indices 12-16) of self.ctrl.torque with arm_torques
+            arm_torques_tensor = torch.tensor(arm_torques, device=self.device, dtype=self.ctrl.torque.dtype)
+            self.ctrl.torque[..., 12:17] = arm_torques_tensor
+
+            
+
+
             self.gym.set_dof_actuation_force_tensor(
                 self.sim, gymtorch.unwrap_tensor(self.ctrl.torque)
             )
@@ -406,7 +1028,9 @@ class IsaacGymEnv(VecEnv):
             self.global_step % self.cfg.domain_rand.push_interval == 0
         ):
             """Random pushes the robots. Emulates an impulse by setting a randomized base velocity."""
-            self.state.root_state[:, 7:13] = torch_rand_float(
+            num_actors_per_env = 4
+            robot_actor_ids = torch.arange(0, self.num_envs * num_actors_per_env, num_actors_per_env, device=self.device)
+            self.state.root_state[robot_actor_ids, 7:13] = torch_rand_float(
                 -self.cfg.domain_rand.max_push_vel,
                 self.cfg.domain_rand.max_push_vel,
                 (self.num_envs, 6),
@@ -420,7 +1044,9 @@ class IsaacGymEnv(VecEnv):
             self.global_step % self.cfg.domain_rand.transport_interval == 0
         ):
             """Randomly transports the robots to a new location"""
-            self.state.root_state[:, 0:3] += (
+            num_actors_per_env = 4
+            robot_actor_ids = torch.arange(0, self.num_envs * num_actors_per_env, num_actors_per_env, device=self.device)
+            self.state.root_state[robot_actor_ids, 0:3] += (
                 torch.randn(
                     self.num_envs,
                     3,
@@ -441,8 +1067,8 @@ class IsaacGymEnv(VecEnv):
             quat_wxyz_transport = p3d.matrix_to_quaternion(
                 p3d.euler_angles_to_matrix(euler_noise, "XYZ")
             )
-            self.state.root_state[:, 3:7] = quat_mul(
-                self.state.root_state[:, 3:7],
+            self.state.root_state[robot_actor_ids, 3:7] = quat_mul(
+                self.state.root_state[robot_actor_ids, 3:7],
                 quat_wxyz_transport[..., [1, 2, 3, 0]],  # reorder to xyzw
             )
 
@@ -450,14 +1076,31 @@ class IsaacGymEnv(VecEnv):
                 self.sim, gymtorch.unwrap_tensor(self.state.root_state)
             )
         self.check_termination(state=self.state, control=self.ctrl)
+        
+        # 检查约束终止
+        constraint_terminations = {}
         for constraint_name, constraint in self.constraints.items():
-            info[f"constraint/{constraint_name}/termination"] = (
-                constraint.check_termination(state=self.state, control=self.ctrl)
-            )
-            self.reset_buf |= info[f"constraint/{constraint_name}/termination"]
+            constraint_termination = constraint.check_termination(state=self.state, control=self.ctrl)
+            info[f"constraint/{constraint_name}/termination"] = constraint_termination
+            constraint_terminations[constraint_name] = constraint_termination
+            self.reset_buf |= constraint_termination
+        
+        # 打印约束终止原因
+        if self.reset_buf.any():
+            env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+            for env_id in env_ids:
+                env_id_int = env_id.item()
+                constraint_reasons = []
+                
+                for constraint_name, constraint_termination in constraint_terminations.items():
+                    if constraint_termination[env_id_int]:
+                        constraint_reasons.append(f"约束违反: {constraint_name}")
+                
+                if constraint_reasons:
+                    print(f"\n⚠️  环境 {env_id_int} 约束终止: {', '.join(constraint_reasons)}")
+                    print("=" * 50)
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
-
         obs = self.get_observations(
             state=self.state,
             setup=self.setup,
@@ -475,8 +1118,26 @@ class IsaacGymEnv(VecEnv):
         )
 
         info.update(self.extras)
+
+        # 把CBF解算的速度替代obs的vel_cmd
+        obs_his = self.obs_history.view(self.num_envs, -1)
+        # print("arm_filter_velocity",self.CBF_filter_velocity[6],self.CBF_filter_velocity[7],self.CBF_filter_velocity[8],
+        #                             self.CBF_filter_velocity[9],self.CBF_filter_velocity[10])
+        # print("self.CBF_filter_velocity",self.CBF_filter_velocity[0],self.CBF_filter_velocity[1],self.CBF_filter_velocity[5])
+        obs_his[:,78] = self.CBF_filter_velocity[0] * 2
+        # obs_his[:,78] = 0.5 * 2
+        obs_his[:,79] = self.CBF_filter_velocity[1] * 2
+        obs_his[:,80] = self.CBF_filter_velocity[5] * 2 # scale
+        # obs_his[:,78] = 0.5 * 2 # vx
+        # obs_his[:,79] = 0.0 # vy
+        # obs_his[:,80] = 0.0 # wz
+        # obs_his[:,81] = 0.3 # wx
+        # print("########################################################")
+        # print("self.CBF_filter_velocity",self.CBF_filter_velocity[0],self.CBF_filter_velocity[1],self.CBF_filter_velocity[5])
+        # print("arm_torques",self.ctrl.torque[..., 12:])
         return (
-            self.obs_history.view(self.num_envs, -1),
+            # self.obs_history.view(self.num_envs, -1),
+            obs_his,
             privileged_obs,
             reward,
             self.reset_buf,
@@ -497,9 +1158,10 @@ class IsaacGymEnv(VecEnv):
             self.episode_step > self.max_episode_length
         )  # no terminal reward for time-outs
         # also reset if robot walks off the safe bounds
+        num_actors_per_env = 4
         walked_off_safe_bounds = torch.logical_or(
-            (self.state.root_pos[:, :2] < self.safe_bounds[None, :, 0]).any(dim=1),
-            (self.state.root_pos[:, :2] > self.safe_bounds[None, :, 1]).any(dim=1),
+            (self.state.root_pos[::num_actors_per_env, :2] < self.safe_bounds[None, :, 0]).any(dim=1),
+            (self.state.root_pos[::num_actors_per_env, :2] > self.safe_bounds[None, :, 1]).any(dim=1),
         )
         self.time_out_buf |= walked_off_safe_bounds
         self.reset_buf |= self.time_out_buf
@@ -510,7 +1172,7 @@ class IsaacGymEnv(VecEnv):
 
         # reset robot states
         self._reset_dofs(env_ids)
-        self._reset_root_states(env_ids)
+        self._reset_root_states(env_ids)  # 这里已经包含了box重置
         for task in self.tasks.values():
             task.reset_idx(env_ids)
         for constraint in self.constraints.values():
@@ -619,11 +1281,19 @@ class IsaacGymEnv(VecEnv):
         setup_obs: Dict[str, EnvSetupAttribute],
     ):
         obs_attrs = []
+        num_actors_per_env = 4
         for name, obs_attr in state_obs.items():
             value = obs_attr(struct=state, generator=self.generator)
-            # print(f"obs_attr: {name}, value: {value.shape}")
+            if name == "root_ang_vel":
+                value = value[::num_actors_per_env]
+            if name == "root_lin_vel":
+                value = value[::num_actors_per_env]
             assert value.shape[-1] == obs_attr.dim
             obs_attrs.append(value)
+        
+
+
+
         state_obs_tensor = torch.cat(
             obs_attrs,
             dim=1,
@@ -633,9 +1303,8 @@ class IsaacGymEnv(VecEnv):
             all_task_obs = []
             for k, task in self.tasks.items():
                 task_obs = task.observe(state=state)
-                print(f"task_obs: {k}, value: {task_obs.shape}")
-                # if k == "locomotion":
-                    # print(f"Locomotion task obs: {task_obs}")
+                if k == "reaching":
+                    task_obs = torch.zeros_like(task_obs)
                 all_task_obs.append(task_obs)
             task_obs_tensor = torch.cat(
                 all_task_obs,
@@ -869,10 +1538,14 @@ class IsaacGymEnv(VecEnv):
         return props
 
     def _reset_root_states(self, env_ids):
-        # base position
-        self.state.root_state[env_ids] = self.base_init_state
+        # 计算机器人actor的索引（每4个actor一组：机器人, box1, box2, box3）
+        num_actors_per_env = 4
+        robot_actor_ids = env_ids * num_actors_per_env
+        
+        # 重置机器人状态
+        self.state.root_state[robot_actor_ids] = self.base_init_state
         if (self.init_pos_noise > 0).any():
-            self.state.root_state[env_ids, 0:3] += torch_rand_float(
+            self.state.root_state[robot_actor_ids, 0:3] += torch_rand_float(
                 -self.init_pos_noise,
                 self.init_pos_noise,
                 (len(env_ids), 3),
@@ -880,7 +1553,6 @@ class IsaacGymEnv(VecEnv):
                 generator=self.generator,
             )
         if (self.init_euler_noise > 0).any():
-
             euler_displacement = torch_rand_float(
                 -self.init_euler_noise,
                 self.init_euler_noise,
@@ -890,11 +1562,11 @@ class IsaacGymEnv(VecEnv):
             )
             matrix = p3d.euler_angles_to_matrix(euler_displacement, "XYZ")
             quat_xyzw = p3d.matrix_to_quaternion(matrix)[..., [1, 2, 3, 0]]
-            self.state.root_state[env_ids, 3:7] = quat_mul(
-                self.state.root_state[env_ids, 3:7], quat_xyzw
+            self.state.root_state[robot_actor_ids, 3:7] = quat_mul(
+                self.state.root_state[robot_actor_ids, 3:7], quat_xyzw
             )
         if (self.init_lin_vel_noise > 0).any():
-            self.state.root_state[env_ids, 7:10] += torch_rand_float(
+            self.state.root_state[robot_actor_ids, 7:10] += torch_rand_float(
                 -self.init_lin_vel_noise,
                 self.init_lin_vel_noise,
                 (len(env_ids), 3),
@@ -902,20 +1574,34 @@ class IsaacGymEnv(VecEnv):
                 generator=self.generator,
             )
         if (self.init_ang_vel_noise > 0).any():
-            self.state.root_state[env_ids, 10:13] += torch_rand_float(
+            self.state.root_state[robot_actor_ids, 10:13] += torch_rand_float(
                 -self.init_ang_vel_noise,
                 self.init_ang_vel_noise,
                 (len(env_ids), 3),
                 device=self.device,
                 generator=self.generator,
             )
-        self.state.root_state[env_ids, :3] += self.env_origins[env_ids]
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self.state.root_state[robot_actor_ids, :3] += self.env_origins[env_ids]
+        
+        # 重置3个box状态
+        box1_actor_ids = env_ids * 4 + 1  # box1索引
+        box2_actor_ids = env_ids * 4 + 2  # box2索引
+        box3_actor_ids = env_ids * 4 + 3  # box3索引
+        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids)
+        
+        # 设置所有actor的状态（包括机器人和3个box）
+        # 创建包含机器人和所有box的actor索引
+        all_actor_ids = torch.cat([
+            robot_actor_ids,    # 机器人actor索引
+            box1_actor_ids,     # box1 actor索引
+            box2_actor_ids,     # box2 actor索引
+            box3_actor_ids      # box3 actor索引
+        ]).to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.state.root_state),
-            gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32),
+            gymtorch.unwrap_tensor(all_actor_ids),
+            len(all_actor_ids),
         )
 
     # ----------------------------------------
@@ -975,6 +1661,22 @@ class IsaacGymEnv(VecEnv):
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
+
+        # 创建box assets
+        box_asset_options = gymapi.AssetOptions()
+        box_asset_options.density = 1000.0  # 水的密度
+        box_asset_options.fix_base_link = True  # 设置为固定基座
+        
+        # 创建3个不同尺寸的box
+        box_asset_1 = self.gym.create_box(
+            self.sim, 0.5, 1.4, 0.01, box_asset_options
+        )
+        box_asset_2 = self.gym.create_box(
+            self.sim, 0.5, 0.05, 0.6, box_asset_options
+        )
+        box_asset_3 = self.gym.create_box(
+            self.sim, 0.5, 0.05, 0.6, box_asset_options
+        )
 
         if not hasattr(self.cfg.domain_rand, "randomize_restitution_rigid_bodies"):
             self.cfg.domain_rand.randomize_restitution_rigid_bodies = []
@@ -1104,6 +1806,7 @@ class IsaacGymEnv(VecEnv):
         start_pose = gymapi.Transform()
         start_pose.p = gymapi.Vec3(*self.base_init_state[:3])
         start_pose.r = gymapi.Quat(*self.base_init_state[3:7])
+        
 
         sensor_pose = gymapi.Transform()
         if not hasattr(self.cfg.asset, "force_sensor_links"):
@@ -1145,6 +1848,7 @@ class IsaacGymEnv(VecEnv):
             self.env_spacing,
         )
         self.actor_handles = []
+        self.box_handles = []  # 添加box actor句柄列表，每个环境3个box
         self.envs = []
 
         for i in range(self.num_envs):
@@ -1156,6 +1860,7 @@ class IsaacGymEnv(VecEnv):
             self.env_origins[i, 0] = origin.x
             self.env_origins[i, 1] = origin.y
             self.env_origins[i, 2] = origin.z
+            
             rigid_shape_props = self._process_rigid_shape_props(
                 rigid_shape_props_asset, i
             )
@@ -1179,8 +1884,78 @@ class IsaacGymEnv(VecEnv):
             self.gym.set_actor_rigid_body_properties(
                 env_handle, actor_handle, body_props, recomputeInertia=True
             )
+            
+            # 创建3个box actors
+            box_handles_env = []
+            
+            # Box 1: 大box (0.5x0.7x0.05) - 在机器人前方
+            box1_offset = gymapi.Vec3(2.0, 0.0, 0.6)
+            # box1_offset = gymapi.Vec3(2.0, 0.0, 2.0)
+            box1_pose = gymapi.Transform()
+            box1_pose.p = start_pose.p + box1_offset
+            box1_pose.r = start_pose.r
+            
+            box1_handle = self.gym.create_actor(
+                env_handle,
+                box_asset_1,
+                box1_pose,
+                f"box1_{i}",
+                i,
+                0,  # collision group
+                0,  # collision filter
+            )
+            
+            # Box 2: 小box (0.05x0.05x0.6) - 在机器人左侧
+            box2_offset = gymapi.Vec3(2.0, -0.7, 0.3)
+            # box2_offset = gymapi.Vec3(2.0, -0.35, 2.0)
+            box2_pose = gymapi.Transform()
+            box2_pose.p = start_pose.p + box2_offset
+            box2_pose.r = start_pose.r
+            
+            box2_handle = self.gym.create_actor(
+                env_handle,
+                box_asset_2,
+                box2_pose,
+                f"box2_{i}",
+                i,
+                0,  # collision group
+                0,  # collision filter
+            )
+            
+            # Box 3: 小box (0.05x0.05x0.6) - 在机器人右侧
+            box3_offset = gymapi.Vec3(2.0, 0.7, 0.3)
+            # box3_offset = gymapi.Vec3(2.0, 0.35, 2.0)
+            box3_pose = gymapi.Transform()
+            box3_pose.p = start_pose.p + box3_offset
+            box3_pose.r = start_pose.r
+            
+            box3_handle = self.gym.create_actor(
+                env_handle,
+                box_asset_3,
+                box3_pose,
+                f"box3_{i}",
+                i,
+                0,  # collision group
+                0,  # collision filter
+            )
+            
+            # 设置box颜色
+            colors = [
+                gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box1
+                gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box2
+                gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box3
+            ]
+            
+            for j, (box_handle, color) in enumerate(zip([box1_handle, box2_handle, box3_handle], colors)):
+                self.gym.set_rigid_body_color(
+                    env_handle, box_handle, 0, 
+                    gymapi.MESH_VISUAL_AND_COLLISION, color
+                )
+                box_handles_env.append(box_handle)
+            
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
+            self.box_handles.append(box_handles_env)
 
         self.termination_contact_indices = torch.zeros(
             len(termination_contact_names),
@@ -1274,7 +2049,10 @@ class IsaacGymEnv(VecEnv):
         self.state.dof_vel[env_ids] = 0.0
         self.state.prev_dof_vel[env_ids] = 0.0
 
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        # env_ids_int32 就是 actor indice 
+        num_actors_per_env = 4
+        env_ids_int32 = (env_ids * num_actors_per_env).to(dtype=torch.int32)
+        # env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(
@@ -1289,6 +2067,48 @@ class IsaacGymEnv(VecEnv):
             gymtorch.unwrap_tensor(env_ids_int32),
             len(env_ids_int32),
         )
+
+    def _reset_box_states_in_root_state(self, env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids):
+        """在root_state中重置3个box物体的位置和状态"""
+        for i, env_id in enumerate(env_ids):
+            if env_id < len(self.box_handles):
+                # 获取机器人的位置（世界坐标）
+                robot_actor_id = env_id * 4
+                robot_pos = self.state.root_state[robot_actor_id, 0:3]
+                
+                # 定义3个box的偏移位置
+                box_offsets = [
+                    torch.tensor([2.0, 0.0, 0.6], device=self.device),   # box1: 前方
+                    torch.tensor((2.0, -0.7, 0.3), device=self.device),  # box2: 左侧
+                    torch.tensor([2.0, 0.7, 0.3], device=self.device),   # box3: 右侧
+                    # torch.tensor([2.0, 0.0, 2.0], device=self.device),   # box1: 前方
+                    # torch.tensor([2.0, -0.35, 2.0], device=self.device),  # box2: 左侧
+                    # torch.tensor([2.0, 0.35, 2.0], device=self.device),   # box3: 右侧
+                ]
+                
+                box_actor_ids = [box1_actor_ids[i], box2_actor_ids[i], box3_actor_ids[i]]
+                
+                # 重置每个box
+                for box_actor_id, box_offset in zip(box_actor_ids, box_offsets):
+                    box_pos = robot_pos + box_offset
+                    box_pos[2] = box_offset[2]
+                    # 无旋转
+                    box_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)  # w, x, y, z
+                    
+                    # 设置box状态到root_state中
+                    self.state.root_state[box_actor_id, 0:3] = box_pos
+                    self.state.root_state[box_actor_id, 3:7] = box_quat
+                    self.state.root_state[box_actor_id, 7:10] = 0.0  # 线速度
+                    self.state.root_state[box_actor_id, 10:13] = 0.0  # 角速度
+
+    def _reset_box_states(self, env_ids):
+        """重置box物体的位置和状态（旧方法，保留兼容性）"""
+        # 这个方法现在调用新的方法
+        num_actors_per_env = 4
+        box1_actor_ids = env_ids * num_actors_per_env + 1
+        box2_actor_ids = env_ids * num_actors_per_env + 2
+        box3_actor_ids = env_ids * num_actors_per_env + 3
+        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids)
 
     def _get_heights(self, env_ids=None):
         """Samples heights of the terrain at required points around each robot.

@@ -482,6 +482,7 @@ class IsaacGymEnv(VecEnv):
 
         info.update(self.extras)
 
+        base_lin_vel = self.state.root_lin_vel[0].cpu().numpy()
 
         return (
             self.obs_history.view(self.num_envs, -1),
@@ -647,9 +648,8 @@ class IsaacGymEnv(VecEnv):
             all_task_obs = []
             for k, task in self.tasks.items():
                 task_obs = task.observe(state=state)
-                # print(f"task_obs: {k}, value: {task_obs.shape}")
-                # if k == "locomotion":
-                    # print(f"Locomotion task obs: {task_obs}")
+                if k == "reaching":
+                    task_obs = torch.zeros_like(task_obs)
                 all_task_obs.append(task_obs)
             task_obs_tensor = torch.cat(
                 all_task_obs,
@@ -1017,10 +1017,10 @@ class IsaacGymEnv(VecEnv):
             self.sim, 0.5, 0.7, 0.05, box_asset_options
         )
         box_asset_2 = self.gym.create_box(
-            self.sim, 0.05, 0.05, 0.6, box_asset_options
+            self.sim, 0.5, 0.05, 0.6, box_asset_options
         )
         box_asset_3 = self.gym.create_box(
-            self.sim, 0.05, 0.05, 0.6, box_asset_options
+            self.sim, 0.5, 0.05, 0.6, box_asset_options
         )
 
         if not hasattr(self.cfg.domain_rand, "randomize_restitution_rigid_bodies"):
@@ -1234,7 +1234,8 @@ class IsaacGymEnv(VecEnv):
             box_handles_env = []
             
             # Box 1: 大box (0.5x0.7x0.05) - 在机器人前方
-            box1_offset = gymapi.Vec3(2.0, 0.0, 0.3)
+            # box1_offset = gymapi.Vec3(2.0, 0.0, 0.3)
+            box1_offset = gymapi.Vec3(2.0, 0.0, 2.0)
             box1_pose = gymapi.Transform()
             box1_pose.p = start_pose.p + box1_offset
             box1_pose.r = start_pose.r
@@ -1250,7 +1251,8 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 2: 小box (0.05x0.05x0.6) - 在机器人左侧
-            box2_offset = gymapi.Vec3(2.0, -0.35, 0.0)
+            # box2_offset = gymapi.Vec3(2.0, -0.35, 0.0)
+            box2_offset = gymapi.Vec3(2.0, -0.35, 2.0)
             box2_pose = gymapi.Transform()
             box2_pose.p = start_pose.p + box2_offset
             box2_pose.r = start_pose.r
@@ -1266,7 +1268,8 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 3: 小box (0.05x0.05x0.6) - 在机器人右侧
-            box3_offset = gymapi.Vec3(2.0, 0.35, 0.0)
+            # box3_offset = gymapi.Vec3(2.0, 0.35, 0.0)
+            box3_offset = gymapi.Vec3(2.0, 0.35, 2.0)
             box3_pose = gymapi.Transform()
             box3_pose.p = start_pose.p + box3_offset
             box3_pose.r = start_pose.r
@@ -1420,9 +1423,12 @@ class IsaacGymEnv(VecEnv):
                 
                 # 定义3个box的偏移位置
                 box_offsets = [
-                    torch.tensor([2.0, 0.0, 0.3], device=self.device),   # box1: 前方
-                    torch.tensor((2.0, -0.35, 0.0), device=self.device),  # box2: 左侧
-                    torch.tensor([2.0, 0.35, 0.0], device=self.device),   # box3: 右侧
+                    # torch.tensor([2.0, 0.0, 0.3], device=self.device),   # box1: 前方
+                    # torch.tensor((2.0, -0.35, 0.0), device=self.device),  # box2: 左侧
+                    # torch.tensor([2.0, 0.35, 0.0], device=self.device),   # box3: 右侧
+                    torch.tensor([2.0, 0.0, 2.0], device=self.device),   # box1: 前方
+                    torch.tensor([2.0, -0.35, 2.0], device=self.device),  # box2: 左侧
+                    torch.tensor([2.0, 0.35, 2.0], device=self.device),   # box3: 右侧
                 ]
                 
                 box_actor_ids = [box1_actor_ids[i], box2_actor_ids[i], box3_actor_ids[i]]

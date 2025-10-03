@@ -48,7 +48,6 @@ class ObservationAttribute:
             )
         if self.offset is not None:
             tensor = tensor - self.offset
-            print("self.offset",self.offset)
         if self.clip is not None:
             tensor = torch.clip(tensor, -self.clip, self.clip)
         return tensor
