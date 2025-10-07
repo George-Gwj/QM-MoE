@@ -677,29 +677,29 @@ class IsaacGymEnv(VecEnv):
         self.h_threshold = 0.05
         self.h_list_min = 1.0
         self.update_beta = False
-        self.velocity_limite = np.array([1, 1, 0.5, 0.2, 0.2, 1.0, 3.14, 3.40, 3.14, 3.93, 3.93])
+        self.velocity_limite = np.array([0.5, 0.5, 1.0, 3.14, 3.40, 3.14, 3.93, 3.93])
         
-        # CBF control configuration (11 DOF: 6 base + 5 arm)
-        self.u_len = 11  # go2-6dof velocity + piper-5dof velocity (same as MuJoCo)
-        self.base_dofs = 6  # x, y, z, roll, pitch, yaw
+        # CBF control configuration (8 DOF: 3 base + 5 arm)
+        self.u_len = 8  # go2-3dof velocity (xy+yaw) + piper-5dof velocity (same as MuJoCo)
+        self.base_dofs = 3  # x, y, yaw
         self.arm_controlled_dofs = 5  # 5 arm joints for velocity control
         self.leg_dofs = 12
 
         # 初始化PD控制器（只创建一次）
         self.pd_controllers = []
         velocity_output_limits = [
-            [-0.4, 0.4], [-0.4, 0.4], [-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5], [-1.0,1.0],
+            [-0.4, 0.4], [-0.4, 0.4], [-1.0,1.0],
             [-3.14, 3.14], [-3.40, 3.40], [-3.14, 3.14], [-3.93, 3.93], [-3.93, 3.93], [-3.93, 3.93]
         ]
-        self.position_kp = np.array([2, 2, 2, 2, 2, 2, 
+        self.position_kp = np.array([2, 2, 2,
                                     21.3016, 27.2393, 50.8360, 15.9196, 22.5215,  5.1744])  # 大幅降低所有手臂关节Kp
-        self.position_kd = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+        self.position_kd = np.array([0.0, 0.0, 0.0,
                                     1.6801, 2.6524, 3.5458, 2.7676, 0.6234, 0.5672])  # 大幅降低所有手臂关节Kd
 
         self.arm_vel_kp = np.array([8, 8, 8, 8, 8, 8])
         self.arm_vel_kd = np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
         self.prev_velocity_error = np.zeros(6)
-        for i in range(12):
+        for i in range(9):
             self.pd_controllers.append(
                 PDController(kp=self.position_kp[i], kd=self.position_kd[i], output_limits=velocity_output_limits[i])
             )
@@ -709,10 +709,10 @@ class IsaacGymEnv(VecEnv):
             self.arm_velocity_pd_controllers.append(
                 PDController(kp=self.arm_vel_kp[i], kd=self.arm_vel_kd[i], output_limits=arm_torques_limits[i])
             )
-        self.current_joint_values = np.array([0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.5, -0.6, 0.0, 0.0])
-        self.current_joint_vel = np.zeros(11)
-        self.CBF_filter_velocity = np.zeros(11)
-        self.target_base_arm_vel = np.zeros(11)
+        self.current_joint_values = np.array([0.0, 0.0, 0.0, 0.0, 0.5, -0.6, 0.0, 0.0])
+        self.current_joint_vel = np.zeros(8)
+        self.CBF_filter_velocity = np.zeros(8)
+        self.target_base_arm_vel = np.zeros(8)
         self.r_arm = np.array([.036,.029,.029,.029,.029,.029,0.25])
         self.x0,self.y0,self.rectangle_r  = self.caculate_rectangle_from_cuboid(0.5, 0.7, 0.05)
         self.x1,self.y1,self.rectangle_r1  = self.caculate_rectangle_from_cuboid(0.5, 0.05, 0.6)
@@ -735,7 +735,7 @@ class IsaacGymEnv(VecEnv):
         self.dt = None
         self.h_list = np.array([0.0,0.0,0.0])
         self.solve_time = []
-        self.ut = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+        self.ut = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
 
         # A* path planning
         self.planner = ParallelAStarPlanner(self.device)
@@ -826,9 +826,9 @@ class IsaacGymEnv(VecEnv):
         # Prepare initial data for CBF process (same format as MuJoCo)
         input_data = {
             "obstacles": obstacles,  # Current obstacle positions
-            "target": self.target_base_arm_vel,  # Target velocities (11)
-            "current_group_joint_values": current_base_arm_pos,  # 11D state
-            "current_group_joint_vel": current_base_arm_vel,  # 11D state velocity
+            "target": self.target_base_arm_vel,  # Target velocities (8)
+            "current_group_joint_values": current_base_arm_pos,  # 8D state
+            "current_group_joint_vel": current_base_arm_vel,  # 8D state velocity
             "safe_R_list": self.safe_R_list,  # Safe radii
             "obs_v": obs_v,  # Obstacle velocities with fault parameter
             "update_beta": True,  # Initialize beta
@@ -1256,7 +1256,7 @@ class IsaacGymEnv(VecEnv):
                     print(f"Env {env_id}: Reached waypoint {old_waypoint}, moving to {new_waypoint}")
                 else:
                     self.waypoint_reached[env_id] = True
-                    print(f"Env {env_id}: Reached final waypoint!")
+                    print(f"Env {env_id}: Reached final waypoint!") 
 
     def _check_replan(self):
         """检查是否需要重新规划路径"""

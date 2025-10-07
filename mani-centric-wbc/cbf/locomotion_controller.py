@@ -175,7 +175,7 @@ def play():
 
     config["env"]["cfg"]["init_state"]["pos"] = [0.0, 0.0, 0.3]
 
-    config["env"]["cfg"]["env"]["episode_length_s"] = 30
+    config["env"]["cfg"]["env"]["episode_length_s"] = 40
 
     config["env"]["_target_"] = "legged_gym.env.isaacgym.env_add_baseinfo_cbf.IsaacGymEnv"
     config["env"]["controller"]["_target_"] = "legged_gym.env.isaacgym.control.PositionControllerCbf"

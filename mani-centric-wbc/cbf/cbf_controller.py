@@ -22,7 +22,7 @@ class DISTURBANCE_OBSERVER:
 
         self.a1=1.1
         self.a2=1.5
-        self.c = 10*np.array([10,10,10,10,10,10,10,10,10,10,10])
+        self.c = 10*np.array([10,10,10,10,10,10,10,10])
         self.a = self.a1*self.c
         self.l = self.a2*np.sqrt(self.c)
         self.z1 = np.zeros(self.u_len).reshape(self.u_len, 1)
@@ -83,7 +83,7 @@ class CBF_controller:
         self.T_step = T_step
         self.O_T_step = O_T_step
         print(f'self.CBF_mode = {self.CBF_mode}')
-        self.u_len=11
+        self.u_len=8
         self.n_conpoment=7
         self.n_base_cbf=3
         if use_statistic_obstacle ==False:
@@ -142,7 +142,7 @@ class CBF_controller:
         self.n_statistic_cbf=self.n_env_limite_cbf+self.statistic_capsule_obstacle_num*self.n_conpoment
 
 
-        self.base_posture = ca.SX.sym('base_posture',6)      #base_posture
+        self.base_posture = ca.SX.sym('base_posture',3)      #base_posture
         self.piper_angles = ca.SX.sym('piper_angles',5)                #angles of joints
         self.state=ca.vertcat(self.base_posture,self.piper_angles)
         # self.angles = ca.SX.sym('angles',self.u_len)                #angles of joints 
@@ -190,14 +190,13 @@ class CBF_controller:
         self.cal_K=ca.DM.zeros((self.n_CBF_constrain, self.u_len))
 
         if out_limite is None:
-            self.output_limite=np.array([1, 1, 0.5, 0.2, 0.2, 1.0, 3.14, 3.40, 3.14, 3.93, 3.93])
+            self.output_limite=np.array([0.5, 0.5, 1.0, 3.14, 3.40, 3.14, 3.93, 3.93])
         else:
             self.output_limite=np.array(out_limite)
 
 
         self.H_mat_para = ca.DM([
-                            1000, 50, 200,   # base 线速度锁死
-                            200, 200, 50,         # base 旋转
+                            200, 200, 200,   # base 线速度锁死
                             0.5, 0.2, 0.3, 0.3, 0.3  # 肩<肘<腕
                         ])  #[200,200,10,2,2,0.8,0.3,0.3] [20,20,10,1,1,1,1,0.3]
         self.H_mat =  ca.diag(self.H_mat_para)
@@ -209,19 +208,15 @@ class CBF_controller:
         self.H_mat_augmented = ca.diag(ca.horzcat(self.H_mat_para.T,
                                        100000*ca.DM.ones(self.slack.size1()).T))
         self.is_slack=True
-        # self.low_joint_limite = np.array([-4,-10,0.25,
-        #                                   -0.5,-0.5,-5,
-        #                                   -2.68,0,-2.697,-1.832,-1.22])
-        # self.up_joint_limite  = np.array([4,10,0.35,
-        #                                   0.5,0.5,5,
-        #                                   2.68,3.14,0,1.832,1.22])  #UR5+gripper/ur5_gripper.urdf
+        self.low_joint_limite = np.array([-10,-10,-5,
+                                          -2.68,0,-2.697,-1.832,-1.22])
+        self.up_joint_limite  = np.array([10,10,5,
+                                          2.68,3.14,0,1.832,1.22])  #UR5+gripper/ur5_gripper.urdf
 
-        self.low_joint_limite = np.array([-4,-10,0.25,
-                                          -0.5,-0.5,-5,
-                                          -3.14,-3.14,-3.14,-3.14,-3.14])
-        self.up_joint_limite  = np.array([4,10,0.35,
-                                          0.5,0.5,5,
-                                          3.14,3.14,3.14,3.14,3.14])  #UR5+gripper/ur5_gripper.urdf
+        # self.low_joint_limite = np.array([-10,-10,-5,
+        #                                   -3.14,-3.14,-3.14,-3.14,-3.14])
+        # self.up_joint_limite  = np.array([10,10,5,
+        #                                   3.14,3.14,3.14,3.14,3.14])  #UR5+gripper/ur5_gripper.urdf
 
         self.get_solution=False
         self.initial_MobileARM()
@@ -231,15 +226,11 @@ class CBF_controller:
 
     def initial_MobileARM(self):
 
-        cos_r = ca.cos(self.base_posture[3]+self.state_velocity[3]*self.T_step)
-        sin_r = ca.sin(self.base_posture[3]+self.state_velocity[3]*self.T_step)
-        cos_p = ca.cos(self.base_posture[4]+self.state_velocity[4]*self.T_step)
-        sin_p = ca.sin(self.base_posture[4]+self.state_velocity[4]*self.T_step)
-        cos_y = ca.cos(self.base_posture[5]+self.state_velocity[5]*self.T_step)
-        sin_y = ca.sin(self.base_posture[5]+self.state_velocity[5]*self.T_step)
+        cos_y = ca.cos(self.base_posture[2]+self.state_velocity[2]*self.T_step)
+        sin_y = ca.sin(self.base_posture[2]+self.state_velocity[2]*self.T_step)
 
-        cos_0,cos_1,cos_2,cos_3,cos_4 = ca.cos(self.piper_angles[0]+self.state_velocity[6]*self.T_step),ca.cos(self.piper_angles[1]+self.state_velocity[7]*self.T_step),ca.cos(self.piper_angles[2]+self.state_velocity[8]*self.T_step),ca.cos(self.piper_angles[3]+self.state_velocity[9]*self.T_step),ca.cos(self.piper_angles[4]+self.state_velocity[10]*self.T_step)
-        sin_0,sin_1,sin_2,sin_3,sin_4 = ca.sin(self.piper_angles[0]+self.state_velocity[6]*self.T_step),ca.sin(self.piper_angles[1]+self.state_velocity[7]*self.T_step),ca.sin(self.piper_angles[2]+self.state_velocity[8]*self.T_step),ca.sin(self.piper_angles[3]+self.state_velocity[9]*self.T_step),ca.sin(self.piper_angles[4]+self.state_velocity[10]*self.T_step)
+        cos_0,cos_1,cos_2,cos_3,cos_4 = ca.cos(self.piper_angles[0]+self.state_velocity[3]*self.T_step),ca.cos(self.piper_angles[1]+self.state_velocity[4]*self.T_step),ca.cos(self.piper_angles[2]+self.state_velocity[5]*self.T_step),ca.cos(self.piper_angles[3]+self.state_velocity[6]*self.T_step),ca.cos(self.piper_angles[4]+self.state_velocity[7]*self.T_step)
+        sin_0,sin_1,sin_2,sin_3,sin_4 = ca.sin(self.piper_angles[0]+self.state_velocity[3]*self.T_step),ca.sin(self.piper_angles[1]+self.state_velocity[4]*self.T_step),ca.sin(self.piper_angles[2]+self.state_velocity[5]*self.T_step),ca.sin(self.piper_angles[3]+self.state_velocity[6]*self.T_step),ca.sin(self.piper_angles[4]+self.state_velocity[7]*self.T_step)
          
         ############   ROBOT CAR JOINT MATRIX
 
@@ -247,13 +238,11 @@ class CBF_controller:
         self.T_XY_CAR=ca.SX.eye(4)
         T_XY_CAR_list =[[1, 0, 0, self.base_posture[0]+self.state_velocity[0]*self.T_step],
                         [0, 1, 0, self.base_posture[1]+self.state_velocity[1]*self.T_step],
-                        [0, 0, 1, self.base_posture[2]+self.state_velocity[2]*self.T_step],
+                        [0, 0, 1, 0.26],
                         [0, 0, 0, 1]] 
         for i in range(16):
             self.T_XY_CAR[i] = T_XY_CAR_list[i%4][i//4]
 
-
-        
         #####ROTATION Z OF CAR
         T_yaw = ca.SX.eye(4)
         T_yaw_list = [[cos_y, -sin_y, 0., 0.],
@@ -263,28 +252,8 @@ class CBF_controller:
         for i in range(16):
             T_yaw[i] = T_yaw_list[i%4][i//4]
 
-        #####ROTATION Y OF CAR (PITCH)
-        T_pitch = ca.SX.eye(4)
-        T_pitch_list = [[cos_p, 0., sin_p, 0.],
-                        [0., 1., 0., 0.],
-                        [-sin_p, 0., cos_p, 0.],
-                        [0., 0., 0., 1.]]
-        for i in range(16):
-            T_pitch[i] = T_pitch_list[i%4][i//4]
-
-
-        #####ROTATION X OF CAR (ROLL)
-        T_roll = ca.SX.eye(4)
-        T_roll_list = [[1., 0., 0., 0.],
-                        [0., cos_r, -sin_r, 0.],
-                        [0., sin_r, cos_r, 0.],
-                        [0., 0., 0., 1.]]
-        for i in range(16):
-            T_roll[i] = T_roll_list[i%4][i//4]
-
-
         # 组合变换（注意顺序：roll -> pitch -> yaw）
-        T_rotation = T_yaw @ T_pitch @ T_roll
+        T_rotation = T_yaw 
 
         self.T_world_base = self.T_XY_CAR @ T_rotation
         ############   ROBOT ARM JOINT MATRIX
@@ -403,7 +372,7 @@ class CBF_controller:
         self.BASE = ca.SX(3,1)
         self.BASE[0] = self.base_posture[0]+self.state_velocity[0]*self.T_step
         self.BASE[1] = self.base_posture[1]+self.state_velocity[1]*self.T_step
-        self.BASE[2] = self.base_posture[2]+self.state_velocity[2]*self.T_step
+        self.BASE[2] = 0.26
 
         #BASEA
         self.BASEA = self.A - self.BASE
