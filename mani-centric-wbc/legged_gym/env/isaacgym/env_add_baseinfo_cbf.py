@@ -30,7 +30,288 @@ PartialConstraint = Callable[[gymapi.Gym, gymapi.Sim, str, torch.Generator], Con
 from cbf.cbf_controller import CBF_controller, DISTURBANCE_OBSERVER
 from multiprocessing import Process, Queue
 import casadi as ca
+import heapq
 
+
+class ParallelAStarPlanner:
+    def __init__(self, device, grid_size=0.1, world_bounds=(-2, 9, -2, 2)):
+        self.device = device
+        self.grid_size = grid_size
+        self.world_bounds = world_bounds
+        self.robot_radius = 0.25  # 四足机器人半径
+        self.safety_margin = 0.05 # 安全裕度（米）
+        # 障碍物位置和尺寸 (x, y, width, length, height)
+        self.obstacles = [
+            (4.0, -0.7, 0.5, 0.05, 0.6),   # box2: 左侧障碍物
+            (4.0, 0.7, 0.5, 0.05, 0.6),    # box3: 右侧障碍物  
+            (2.0, 0.0, 0.3, 0.3, 0.3),     # box4: 前方障碍物
+        ]
+    
+
+    def smooth_path_3d(self, path, weight_data=0.1, weight_smooth=0.3, tolerance=0.00001):
+        """3D路径平滑处理（保持yaw角度）"""
+        if path is None or len(path) < 3:
+            return path
+            
+        # 分离坐标和角度
+        path_array = np.array([[point[0], point[1], point[2]] for point in path])
+        smoothed = np.copy(path_array)
+        
+        change = tolerance
+        while change >= tolerance:
+            change = 0.0
+            for i in range(1, len(path_array)-1):
+                for j in range(3):  # x, y, yaw
+                    aux = smoothed[i][j]
+                    smoothed[i][j] += weight_data * (path_array[i][j] - smoothed[i][j])
+                    smoothed[i][j] += weight_smooth * (smoothed[i-1][j] + smoothed[i+1][j] - 2 * smoothed[i][j])
+                    change += abs(aux - smoothed[i][j])
+                    
+        # 转换回列表格式
+        return [(x, y, yaw) for x, y, yaw in smoothed]
+
+    def create_grid(self, num_envs):
+        """创建栅格地图"""
+        x_min, x_max, y_min, y_max = self.world_bounds
+        grid_width = int((x_max - x_min) / self.grid_size) + 1
+        grid_height = int((y_max - y_min) / self.grid_size) + 1
+        
+        grid = torch.ones((num_envs, grid_height, grid_width), 
+                         device=self.device, dtype=torch.bool)
+        
+        return grid, (x_min, y_min, grid_width, grid_height)
+    
+    def add_obstacles_to_grid(self, grid, grid_info):
+        """将障碍物添加到栅格地图中（考虑机器人半径和安全裕度）"""
+        x_min, y_min, grid_width, grid_height = grid_info
+        
+        for obstacle in self.obstacles:
+            x_center, y_center, width, length, _ = obstacle
+            
+            # 计算膨胀后的障碍物尺寸（机器人半径 + 安全裕度）
+            inflated_width = width + 2 * (self.robot_radius + self.safety_margin)
+            inflated_length = length + 2 * (self.robot_radius + self.safety_margin)
+            
+            # 计算膨胀后的障碍物在栅格中的边界
+            x_start = int((x_center - inflated_width/2 - x_min) / self.grid_size)
+            x_end = int((x_center + inflated_width/2 - x_min) / self.grid_size) + 1
+            y_start = int((y_center - inflated_length/2 - y_min) / self.grid_size)  
+            y_end = int((y_center + inflated_length/2 - y_min) / self.grid_size) + 1
+            
+            # 确保边界在栅格范围内
+            x_start = max(0, min(x_start, grid_width))
+            x_end = max(0, min(x_end, grid_width))
+            y_start = max(0, min(y_start, grid_height))
+            y_end = max(0, min(y_end, grid_height))
+            
+            # 将障碍物区域标记为不可通行
+            grid[:, y_start:y_end, x_start:x_end] = False
+            
+        return grid
+    
+    def world_to_grid(self, point, grid_info):
+        """世界坐标转栅格坐标"""
+        x, y = point[0], point[1]
+        x_min, y_min, grid_width, grid_height = grid_info
+        
+        grid_x = int((x - x_min) / self.grid_size)
+        grid_y = int((y - y_min) / self.grid_size)
+        
+        return (grid_x, grid_y)
+    
+    def grid_to_world(self, grid_point, grid_info):
+        """栅格坐标转世界坐标"""
+        grid_x, grid_y = grid_point
+        x_min, y_min, grid_width, grid_height = grid_info
+        
+        x = grid_x * self.grid_size + x_min
+        y = grid_y * self.grid_size + y_min
+        
+        return (x, y)
+    
+    def heuristic(self, a, b):
+        """启发式函数"""
+        return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+    
+    def get_neighbors(self, point, grid, grid_info, env_idx=0):
+        """获取相邻栅格"""
+        x, y = point
+        grid_width, grid_height = grid_info[2], grid_info[3]
+        
+        neighbors = []
+        directions = [(0,1), (1,0), (0,-1), (-1,0), 
+                     (1,1), (1,-1), (-1,1), (-1,-1)]
+        
+        for dx, dy in directions:
+            nx, ny = x + dx, y + dy
+            if (0 <= nx < grid_width and 0 <= ny < grid_height and 
+                grid[env_idx, ny, nx]):
+                cost = 1.0 if abs(dx) + abs(dy) == 1 else 1.414
+                neighbors.append(((nx, ny), cost))
+                
+        return neighbors
+    
+    def a_star_single(self, start, goal, grid, grid_info, env_idx=0):
+        """改进的A*算法 - 考虑机器人半径和路径方向"""
+        # 提取2D坐标用于路径规划
+        start_2d = (start[0], start[1]) if len(start) > 2 else start
+        goal_2d = (goal[0], goal[1]) if len(goal) > 2 else goal
+        
+        start_grid = self.world_to_grid(start_2d, grid_info)
+        goal_grid = self.world_to_grid(goal_2d, grid_info)
+        
+        # 检查起点和终点是否可通行（考虑机器人半径）
+        if not self._is_position_valid(start_2d, grid, grid_info, env_idx) or \
+        not self._is_position_valid(goal_2d, grid, grid_info, env_idx):
+            print(f"Start or goal position is invalid for env {env_idx}")
+            return None
+        
+        # A*算法数据结构初始化
+        open_set = []  # 优先队列，存储待探索节点 (f_score, position)
+        heapq.heappush(open_set, (0, start_grid))
+        
+        came_from = {}  # 记录每个节点的前驱节点，用于重建路径
+        g_score = {start_grid: 0}  # 从起点到当前节点的实际代价
+        f_score = {start_grid: self.heuristic(start_grid, goal_grid)}  # 估计总代价 = g_score + 启发式
+        
+        # 已探索节点集合（可选，用于优化）
+        closed_set = set()
+        
+        while open_set:
+            # 从开放列表取出f_score最小的节点
+            current_f, current = heapq.heappop(open_set)
+            
+            # 如果到达目标，重建路径
+            if current == goal_grid:
+                path_2d = self._reconstruct_path(came_from, current, start_grid, grid_info)
+                # 为2D路径添加yaw角度
+                path_with_yaw = self._add_yaw_to_path(path_2d, start, goal)
+                return path_with_yaw
+            
+            # 将当前节点加入关闭列表
+            closed_set.add(current)
+            
+            # 探索当前节点的所有邻居
+            for neighbor, move_cost in self.get_neighbors(current, grid, grid_info, env_idx):
+                # 如果邻居已在关闭列表中，跳过
+                if neighbor in closed_set:
+                    continue
+                
+                # 计算从起点经过当前节点到邻居的代价
+                tentative_g = g_score[current] + move_cost
+                
+                # 如果找到更优路径，更新邻居信息
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score[neighbor] = tentative_g + self.heuristic(neighbor, goal_grid)
+                    
+                    # 如果邻居不在开放列表中，添加它
+                    if neighbor not in [item[1] for item in open_set]:
+                        heapq.heappush(open_set, (f_score[neighbor], neighbor))
+        
+        # 开放列表为空但未找到路径
+        print(f"No path found from {start_2d} to {goal_2d} for env {env_idx}")
+        return None
+
+    def _is_position_valid(self, position, grid, grid_info, env_idx):
+        """检查位置是否有效（考虑机器人半径）"""
+        grid_pos = self.world_to_grid(position, grid_info)
+        
+        # 检查中心点是否可通行
+        if not grid[env_idx, grid_pos[1], grid_pos[0]]:
+            return False
+        
+        # 检查机器人半径范围内的所有点
+        robot_radius_cells = int(self.robot_radius / self.grid_size) + 1
+        
+        for dx in range(-robot_radius_cells, robot_radius_cells + 1):
+            for dy in range(-robot_radius_cells, robot_radius_cells + 1):
+                # 计算实际距离（欧几里得距离）
+                distance = np.sqrt(dx**2 + dy**2) * self.grid_size
+                if distance <= self.robot_radius:
+                    check_x = grid_pos[0] + dx
+                    check_y = grid_pos[1] + dy
+                    
+                    # 检查边界
+                    if (0 <= check_x < grid_info[2] and 0 <= check_y < grid_info[3]):
+                        if not grid[env_idx, check_y, check_x]:
+                            return False
+        
+        return True
+
+    def _reconstruct_path(self, came_from, current, start_grid, grid_info):
+        """从终点回溯重建路径"""
+        path = []
+        while current in came_from:
+            world_pos = self.grid_to_world(current, grid_info)
+            path.append(world_pos)
+            current = came_from[current]
+        
+        # 添加起点
+        world_pos = self.grid_to_world(start_grid, grid_info)
+        path.append(world_pos)
+        path.reverse()
+        
+        return path
+
+    def _add_yaw_to_path(self, path_2d, start, goal):
+        """为2D路径添加yaw角度"""
+        if len(path_2d) < 2:
+            return [(path_2d[0][0], path_2d[0][1], 0.0)] if path_2d else []
+        
+        path_with_yaw = []
+        
+        for i, (x, y) in enumerate(path_2d):
+            if i == 0:
+                # 起点使用起始yaw
+                yaw = start[2] if len(start) > 2 else 0.0
+            elif i == len(path_2d) - 1:
+                # 终点使用目标yaw
+                yaw = goal[2] if len(goal) > 2 else 0.0
+            else:
+                # 中间点计算前进方向
+                next_x, next_y = path_2d[i + 1]
+                yaw = np.arctan2(next_y - y, next_x - x)
+            
+            path_with_yaw.append((x, y, yaw))
+        
+        return path_with_yaw
+    
+    def plan_paths_parallel(self, starts, goals, num_envs):
+        """为所有环境并行规划路径"""
+        grid, grid_info = self.create_grid(num_envs)
+        grid = self.add_obstacles_to_grid(grid, grid_info)
+        
+        all_paths = []
+        for env_idx in range(num_envs):
+            start = starts[env_idx] if torch.is_tensor(starts) else starts
+            goal = goals[env_idx] if torch.is_tensor(goals) else goals
+            
+            path = self.a_star_single((start[0][0], start[0][1]), (goal[0][0], goal[0][1]), grid, grid_info, env_idx)
+            all_paths.append(path)
+            
+        return all_paths
+    
+    def smooth_path(self, path, weight_data=0.1, weight_smooth=0.3, tolerance=0.00001):
+        """路径平滑处理"""
+        if path is None or len(path) < 3:
+            return path
+            
+        path_array = np.array(path)
+        smoothed = np.copy(path_array)
+        
+        change = tolerance
+        while change >= tolerance:
+            change = 0.0
+            for i in range(1, len(path_array)-1):
+                for j in range(2):  # x, y
+                    aux = smoothed[i][j]
+                    smoothed[i][j] += weight_data * (path_array[i][j] - smoothed[i][j])
+                    smoothed[i][j] += weight_smooth * (smoothed[i-1][j] + smoothed[i+1][j] - 2 * smoothed[i][j])
+                    change += abs(aux - smoothed[i][j])
+                    
+        return smoothed.tolist()
 
 class SuppressOutput:
     """Context manager to suppress qpOASES output"""
@@ -358,7 +639,7 @@ class IsaacGymEnv(VecEnv):
         # 添加CBF相关的init
         self.T_step = 0.005
         self.O_T_step = 0.00085
-        self.obstacle_type_num = [0, 0, 3]
+        self.obstacle_type_num = [0, 0, 4]
         self.use_robust = True
         self.use_dynamic = False
         self.set_disturbance = False
@@ -435,15 +716,18 @@ class IsaacGymEnv(VecEnv):
         self.r_arm = np.array([.036,.029,.029,.029,.029,.029,0.25])
         self.x0,self.y0,self.rectangle_r  = self.caculate_rectangle_from_cuboid(0.5, 0.7, 0.05)
         self.x1,self.y1,self.rectangle_r1  = self.caculate_rectangle_from_cuboid(0.5, 0.05, 0.6)
-        self.x2,self.y2,self.rectangle_r2  = self.caculate_rectangle_from_cuboid(0.5, 0.05, 0.6)       
+        self.x2,self.y2,self.rectangle_r2  = self.caculate_rectangle_from_cuboid(0.5, 0.05, 0.6)
+        self.x3,self.y3,self.rectangle_r3  = self.caculate_rectangle_from_cuboid(0.3, 0.3, 0.3)       
         self.r_safe_expand = 0.01
         self.safe_R_list = np.array([
             self.r_arm+self.rectangle_r+2.5*self.r_safe_expand,
             self.r_arm+self.rectangle_r1+2.5*self.r_safe_expand,
             self.r_arm+self.rectangle_r2+2.5*self.r_safe_expand,
+            self.r_arm+self.rectangle_r3+2.5*self.r_safe_expand,
         ])
         # 障碍物速度
         self.obs_v = np.array([
+            [0.0,0.0,0.0],
             [0.0,0.0,0.0],
             [0.0,0.0,0.0],
             [0.0,0.0,0.0],
@@ -452,6 +736,71 @@ class IsaacGymEnv(VecEnv):
         self.h_list = np.array([0.0,0.0,0.0])
         self.solve_time = []
         self.ut = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+
+        # A* path planning
+        self.planner = ParallelAStarPlanner(self.device)
+            
+        # 路径相关变量
+        self.paths = [None] * self.num_envs
+        self.smoothed_paths = [None] * self.num_envs
+        self.current_waypoint_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.waypoint_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # 起点和终点
+        self.start_positions = torch.zeros((self.num_envs, 3), device=self.device)
+        self.goal_positions = torch.tensor([[7.0, 0.0, 0.0]] * self.num_envs, device=self.device)
+        
+        # 路径规划参数
+        self.waypoint_threshold = 0.2
+        self.replan_interval = 100
+        self.replan_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        
+        # 在初始化时就规划路径
+        self._initial_path_planning()
+
+
+    def _initial_path_planning(self):
+        """初始路径规划 - 包含3D平滑"""
+        starts = []
+        goals = []
+        
+        for env_id in range(self.num_envs):
+            # 使用初始位置作为起点（包含yaw角度）
+            starts.append([0.0, 0.0, 0.0])  # 初始位置 (0,0,0) - 包含yaw
+            goals.append([7.0, 0.0, 0.0])   # 目标位置 (7,0,0) - 包含yaw
+        
+        # 规划路径
+        new_paths = self.planner.plan_paths_parallel(starts, goals, self.num_envs)
+        
+        # 更新路径
+        for env_id in range(self.num_envs):
+            if new_paths[env_id] is not None:
+                # 使用3D平滑路径
+                smoothed_path = self.planner.smooth_path_3d(new_paths[env_id])
+                full_path = smoothed_path
+                
+                self.paths[env_id] = new_paths[env_id]  # 保留原始路径
+                self.smoothed_paths[env_id] = full_path  # 使用平滑后的路径
+                self.current_waypoint_idx[env_id] = 0
+                print(f"Environment {env_id} path planned with {len(full_path)} waypoints (smoothed)")
+                
+                # 打印路径信息用于调试
+                print(f"Env {env_id} original path points: {len(new_paths[env_id])}")
+                print(f"Env {env_id} smoothed path points: {len(full_path)}")
+                print(f"Env {env_id} path: {full_path[:3]}...{full_path[-3:] if len(full_path) > 6 else ''}")
+            else:
+                print(f"Warning: Path planning failed for env {env_id}")
+                # 创建默认的直线路径作为fallback
+                default_path = [
+                    (0.0, 0.0, 0.0),  # 起点
+                    (3.5, 0.0, 0.0),  # 中间点
+                    (7.0, 0.0, 0.0)   # 终点
+                ]
+                self.smoothed_paths[env_id] = default_path
+                self.current_waypoint_idx[env_id] = 0
+
+
+
 
     def caculate_rectangle_from_cuboid(self,a,b,h):
         arr = sorted([a, b, h], reverse=True)        
@@ -464,7 +813,7 @@ class IsaacGymEnv(VecEnv):
         obstacles = self.update_obstacle_data()
         
         # Get current joint values and velocities
-        self.target_base_arm_vel=self.update_base_arm_pos_pid()
+        self.target_base_arm_vel=self.update_base_arm_pos_pid(env_idx=0)
         current_base_arm_pos, current_base_arm_vel=self.update_joint_pos_vel()
         
         # Calculate obstacle velocities
@@ -699,8 +1048,10 @@ class IsaacGymEnv(VecEnv):
 
         """Update obstacle positions and velocities"""
         # 将CUDA张量转换为CPU numpy数组
-        obstacles_pos = self.state.root_pos[1:4].cpu().numpy()
-        obstacles_vel = self.state.root_lin_vel[1:4].cpu().numpy()
+        # 注意：现在使用4个box作为障碍物（box1, box2, box3, box4）
+        num_actor_per_env = 5
+        obstacles_pos = self.state.root_pos[1:num_actor_per_env].cpu().numpy()
+        obstacles_vel = self.state.root_lin_vel[1:num_actor_per_env].cpu().numpy()
 
         rectangle_obstacle_input = np.array([[obstacles_pos[0][0],obstacles_pos[0][1],obstacles_pos[0][2],
                                              obstacles_pos[0][0]-self.x0/2,obstacles_pos[0][1]+self.y0/2,obstacles_pos[0][2],
@@ -714,29 +1065,31 @@ class IsaacGymEnv(VecEnv):
                                              obstacles_pos[2][0]-self.x2/2,obstacles_pos[2][1]+self.y2/2,obstacles_pos[2][2],
                                              obstacles_pos[2][0]+self.x2/2,obstacles_pos[2][1]+self.y2/2,obstacles_pos[2][2],
                                              obstacles_pos[2][0]-self.x2/2,obstacles_pos[2][1]-self.y2/2,obstacles_pos[2][2]],
+                                             [obstacles_pos[3][0],obstacles_pos[3][1],obstacles_pos[3][2],
+                                             obstacles_pos[3][0]-self.x3/2,obstacles_pos[3][1]+self.y3/2,obstacles_pos[3][2],
+                                             obstacles_pos[3][0]+self.x3/2,obstacles_pos[3][1]+self.y3/2,obstacles_pos[3][2],
+                                             obstacles_pos[3][0]-self.x3/2,obstacles_pos[3][1]-self.y3/2,obstacles_pos[3][2]],
                                              ]) 
-
-        print("rectangle_obstacle_input",rectangle_obstacle_input)
     
         return [np.array([]),np.array([]),rectangle_obstacle_input]
 
     def get_constraint_info(self, constraint_idx):
         """解析约束索引对应的约束信息"""
         # 根据CBF控制器的结构解析约束
-        # obstacle_type_num = [0, 0, 3] (sphere, capsule, rectangle)
+        # obstacle_type_num = [0, 0, 4] (sphere, capsule, rectangle)
         # n_conpoment = 7 (机械臂组件数)
         # n_base_cbf = 3 (基础CBF数量)
         # n_statistic_cbf = 8 (统计CBF数量)
         
         sphere_num = self.obstacle_type_num[0]  # 0
         capsule_num = self.obstacle_type_num[1]  # 0  
-        rectangle_num = self.obstacle_type_num[2]  # 3
+        rectangle_num = self.obstacle_type_num[2]  # 4
         n_conpoment = 7
         n_base_cbf = 3
         n_statistic_cbf = 8
         
-        totle_num = sphere_num + capsule_num + rectangle_num  # 3
-        obstacle_constraints = totle_num * n_conpoment  # 3 * 7 = 21
+        totle_num = sphere_num + capsule_num + rectangle_num  # 4
+        obstacle_constraints = totle_num * n_conpoment  # 4 * 7 = 28
         
         if constraint_idx < obstacle_constraints:
             # 障碍物约束
@@ -775,16 +1128,16 @@ class IsaacGymEnv(VecEnv):
         
         joint3_constraints = {}
         
-        # obstacle_type_num = [0, 0, 3]
+        # obstacle_type_num = [0, 0, 4]
         # n_conpoment = 7
         # joint3对应component_idx = 2 (link2)
         
         sphere_num = self.obstacle_type_num[0]  # 0
         capsule_num = self.obstacle_type_num[1]  # 0  
-        rectangle_num = self.obstacle_type_num[2]  # 3
+        rectangle_num = self.obstacle_type_num[2]  # 4
         n_conpoment = 7
         
-        totle_num = sphere_num + capsule_num + rectangle_num  # 3
+        totle_num = sphere_num + capsule_num + rectangle_num  # 4
         
         # 查找所有joint3相关的约束
         for obstacle_idx in range(totle_num):
@@ -797,31 +1150,36 @@ class IsaacGymEnv(VecEnv):
         
         return joint3_constraints
 
-    def update_base_arm_pos_pid(self):  
-        """Update base and arm positions using PD control"""
-        target_base_arm_joint = [7.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.5, -0.6, 0.0, 0.0, 0.0]
+    def update_base_arm_pos_pid(self,env_idx):  
+        """使用路径点更新基座和手臂位置"""
+        # 获取当前路径点作为目标
+        current_waypoint = self.smoothed_paths[env_idx][self.current_waypoint_idx[env_idx]]
+
+        # 使用路径点作为基座目标
+        target_base_arm_joint = [
+            current_waypoint[0].item(),  # x
+            current_waypoint[1].item(),  # y 
+            0.3,                         # z (固定高度)
+            0.0, 0.0,                    # roll, pitch
+            current_waypoint[2].item(),  # yaw
+            0.0, 0.5, -0.6, 0.0, 0.0    # 手臂关节
+        ]
+        
         target_base_arm_vel = []
         for i in range(11):
-            # base
-            if i < 6:
+            if i < 6:  # 基座
                 vel = self.pd_controllers[i].update(
                     target_base_arm_joint[i], 
                     self.current_joint_values[i]
                 )
                 target_base_arm_vel.append(vel)
-
-            # arm
-            if i >= 6:
+            else:  # 手臂
                 vel = self.position_kp[i] * (target_base_arm_joint[i] - self.current_joint_values[i]) - self.position_kd[i] * self.current_joint_vel[i]
                 target_base_arm_vel.append(vel)
 
-        return np.array(target_base_arm_vel)
 
 
-
-
-
-
+        return target_base_arm_vel
 
 
     @property
@@ -866,6 +1224,56 @@ class IsaacGymEnv(VecEnv):
         rgb = rgb.reshape(rgb.shape[0], -1, 4)
         return rgb[..., :3]
 
+    # 修正路径跟踪方法
+    def _update_path_tracking(self):
+        """更新路径跟踪状态"""
+        num_actors_per_env = 5  # 每个环境有5个actor
+        
+        for env_id in range(self.num_envs):
+            if (self.smoothed_paths[env_id] is None or 
+                self.current_waypoint_idx[env_id] >= len(self.smoothed_paths[env_id])):
+                continue
+            
+            # 获取当前路径点
+            current_waypoint = self.smoothed_paths[env_id][self.current_waypoint_idx[env_id]]
+            
+            # 获取机器人当前位置（第一个actor是机器人）
+            robot_actor_idx = env_id * num_actors_per_env
+            robot_pos = self.state.root_state[robot_actor_idx, 0:3].cpu().numpy()  # [x, y, z]
+            
+            # 计算到当前路径点的距离（只考虑x,y）
+            distance = np.sqrt(
+                (robot_pos[0] - current_waypoint[0].item())**2 + 
+                (robot_pos[1] - current_waypoint[1].item())**2
+            )
+            
+            # 检查是否到达路径点
+            if distance < self.waypoint_threshold:
+                if self.current_waypoint_idx[env_id] < len(self.smoothed_paths[env_id]) - 1:
+                    old_waypoint = self.smoothed_paths[env_id][self.current_waypoint_idx[env_id]]
+                    self.current_waypoint_idx[env_id] += 1
+                    new_waypoint = self.smoothed_paths[env_id][self.current_waypoint_idx[env_id]]
+                    print(f"Env {env_id}: Reached waypoint {old_waypoint}, moving to {new_waypoint}")
+                else:
+                    self.waypoint_reached[env_id] = True
+                    print(f"Env {env_id}: Reached final waypoint!")
+
+    def _check_replan(self):
+        """检查是否需要重新规划路径"""
+        self.replan_counter += 1
+        
+        need_replan = []
+        for env_id in range(self.num_envs):
+            # 每replan_interval步重新规划一次，或者如果机器人偏离路径太远
+            if self.replan_counter[env_id] >= self.replan_interval:
+                need_replan.append(env_id)
+                self.replan_counter[env_id] = 0
+        
+        if need_replan:
+            self._replan_paths(need_replan)
+
+
+
     def step(
         self,
         action: torch.Tensor,
@@ -901,6 +1309,13 @@ class IsaacGymEnv(VecEnv):
                 info["vis"] = vis
         decimation_count = self.controller.decimation_count
         time_start = time.time()
+
+        # 路径跟踪和更新
+        self._update_path_tracking()  
+        # 定期重新规划路径（如果需要）
+        # self._check_replan()
+
+
         for decimation_step in range(decimation_count):
 
 
@@ -926,11 +1341,11 @@ class IsaacGymEnv(VecEnv):
                 #     print(f"约束值: {self.h_list[min_idx]:.6f}")
                 #     print("==================")
 
-            self.target_base_arm_vel=self.update_base_arm_pos_pid()
+            self.target_base_arm_vel=self.update_base_arm_pos_pid(env_idx=0)
             current_base_arm_pos, current_base_arm_vel=self.update_joint_pos_vel()
 
             self.obstacles=self.update_obstacle_data()
-            
+    
             input_data={"obstacles":self.obstacles,
             "target":self.target_base_arm_vel,
             "current_group_joint_values":current_base_arm_pos,
@@ -984,7 +1399,7 @@ class IsaacGymEnv(VecEnv):
             arm_torques_tensor = torch.tensor(arm_torques, device=self.device, dtype=self.ctrl.torque.dtype)
             self.ctrl.torque[..., 12:17] = arm_torques_tensor
 
-            
+
 
 
             self.gym.set_dof_actuation_force_tensor(
@@ -1028,7 +1443,7 @@ class IsaacGymEnv(VecEnv):
             self.global_step % self.cfg.domain_rand.push_interval == 0
         ):
             """Random pushes the robots. Emulates an impulse by setting a randomized base velocity."""
-            num_actors_per_env = 4
+            num_actors_per_env = 5
             robot_actor_ids = torch.arange(0, self.num_envs * num_actors_per_env, num_actors_per_env, device=self.device)
             self.state.root_state[robot_actor_ids, 7:13] = torch_rand_float(
                 -self.cfg.domain_rand.max_push_vel,
@@ -1044,7 +1459,7 @@ class IsaacGymEnv(VecEnv):
             self.global_step % self.cfg.domain_rand.transport_interval == 0
         ):
             """Randomly transports the robots to a new location"""
-            num_actors_per_env = 4
+            num_actors_per_env = 5
             robot_actor_ids = torch.arange(0, self.num_envs * num_actors_per_env, num_actors_per_env, device=self.device)
             self.state.root_state[robot_actor_ids, 0:3] += (
                 torch.randn(
@@ -1125,9 +1540,12 @@ class IsaacGymEnv(VecEnv):
         #                             self.CBF_filter_velocity[9],self.CBF_filter_velocity[10])
         # print("self.CBF_filter_velocity",self.CBF_filter_velocity[0],self.CBF_filter_velocity[1],self.CBF_filter_velocity[5])
         obs_his[:,78] = self.CBF_filter_velocity[0] * 2
+        # obs_his[:,78] = self.target_base_arm_vel[0] * 2
         # obs_his[:,78] = 0.5 * 2
         obs_his[:,79] = self.CBF_filter_velocity[1] * 2
+        # obs_his[:,79] = self.target_base_arm_vel[1] * 2
         obs_his[:,80] = self.CBF_filter_velocity[5] * 2 # scale
+        # obs_his[:,80] = self.target_base_arm_vel[5] * 2 # scale
         # obs_his[:,78] = 0.5 * 2 # vx
         # obs_his[:,79] = 0.0 # vy
         # obs_his[:,80] = 0.0 # wz
@@ -1158,7 +1576,7 @@ class IsaacGymEnv(VecEnv):
             self.episode_step > self.max_episode_length
         )  # no terminal reward for time-outs
         # also reset if robot walks off the safe bounds
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         walked_off_safe_bounds = torch.logical_or(
             (self.state.root_pos[::num_actors_per_env, :2] < self.safe_bounds[None, :, 0]).any(dim=1),
             (self.state.root_pos[::num_actors_per_env, :2] > self.safe_bounds[None, :, 1]).any(dim=1),
@@ -1211,6 +1629,67 @@ class IsaacGymEnv(VecEnv):
         # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
+
+
+        # 重置路径规划相关状态
+        self.current_waypoint_idx[env_ids] = 0
+        self.waypoint_reached[env_ids] = False
+        self.replan_counter[env_ids] = 0
+        
+        # 为重置的环境重新规划路径
+        self._replan_paths(env_ids)
+
+    def _replan_paths(self, env_ids):
+        """为指定环境重新规划路径 - 修复3D路径处理"""
+        starts = []
+        goals = []
+        
+        for env_id in env_ids:
+            # 获取机器人当前位置和朝向作为起点
+            num_actor_per_env = 5
+            root_pos = self.state.root_state[env_id*num_actor_per_env, :6]
+            
+            # 获取当前yaw角度
+            robot_yaw = root_pos[5]
+            
+            starts.append((root_pos[0], root_pos[1], robot_yaw))
+            goals.append((self.goal_positions[env_id, 0].item(), 
+                        self.goal_positions[env_id, 1].item(), 
+                        0.0))  # 目标朝向设为0
+        
+        # 规划路径
+        new_paths = self.planner.plan_paths_parallel(starts, goals, len(env_ids))
+        
+        # 更新路径
+        for i, env_id in enumerate(env_ids):
+            if new_paths[i] is not None:
+                # 使用3D平滑路径
+                if hasattr(self.planner, 'smooth_path_3d'):
+                    smoothed_path = self.planner.smooth_path_3d(new_paths[i])
+                else:
+                    # 如果没有3D平滑方法，直接使用原始路径
+                    smoothed_path = new_paths[i]
+                
+                full_path = smoothed_path
+                
+                self.paths[env_id] = new_paths[i]  # 保留原始路径
+                self.smoothed_paths[env_id] = full_path  # 使用平滑后的路径
+                self.current_waypoint_idx[env_id] = 0
+                
+                print(f"Env {env_id} replanned path with {len(full_path)} waypoints")
+                
+            else:
+                # 路径规划失败，使用直线路径
+                print(f"Warning: Path planning failed for env {env_id}, using straight line")
+                start = starts[i]
+                goal = goals[i]
+                self.smoothed_paths[env_id] = [
+                    (start[0], start[1], start[2]),
+                    (goal[0], goal[1], goal[2])
+                ]
+                self.current_waypoint_idx[env_id] = 0
+
+
 
     def compute_reward(self, state: EnvState, control: Control):
         """Compute rewards
@@ -1281,7 +1760,7 @@ class IsaacGymEnv(VecEnv):
         setup_obs: Dict[str, EnvSetupAttribute],
     ):
         obs_attrs = []
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         for name, obs_attr in state_obs.items():
             value = obs_attr(struct=state, generator=self.generator)
             if name == "root_ang_vel":
@@ -1539,7 +2018,7 @@ class IsaacGymEnv(VecEnv):
 
     def _reset_root_states(self, env_ids):
         # 计算机器人actor的索引（每4个actor一组：机器人, box1, box2, box3）
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         robot_actor_ids = env_ids * num_actors_per_env
         
         # 重置机器人状态
@@ -1583,19 +2062,21 @@ class IsaacGymEnv(VecEnv):
             )
         self.state.root_state[robot_actor_ids, :3] += self.env_origins[env_ids]
         
-        # 重置3个box状态
-        box1_actor_ids = env_ids * 4 + 1  # box1索引
-        box2_actor_ids = env_ids * 4 + 2  # box2索引
-        box3_actor_ids = env_ids * 4 + 3  # box3索引
-        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids)
+        # 重置4个box状态
+        box1_actor_ids = env_ids * num_actors_per_env + 1  # box1索引
+        box2_actor_ids = env_ids * num_actors_per_env + 2  # box2索引
+        box3_actor_ids = env_ids * num_actors_per_env + 3  # box3索引
+        box4_actor_ids = env_ids * num_actors_per_env + 4  # box4索引
+        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids, box4_actor_ids)
         
-        # 设置所有actor的状态（包括机器人和3个box）
+        # 设置所有actor的状态（包括机器人和4个box）
         # 创建包含机器人和所有box的actor索引
         all_actor_ids = torch.cat([
             robot_actor_ids,    # 机器人actor索引
             box1_actor_ids,     # box1 actor索引
             box2_actor_ids,     # box2 actor索引
-            box3_actor_ids      # box3 actor索引
+            box3_actor_ids,     # box3 actor索引
+            box4_actor_ids      # box4 actor索引
         ]).to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
@@ -1667,7 +2148,7 @@ class IsaacGymEnv(VecEnv):
         box_asset_options.density = 1000.0  # 水的密度
         box_asset_options.fix_base_link = True  # 设置为固定基座
         
-        # 创建3个不同尺寸的box
+        # 创建4个不同尺寸的box
         box_asset_1 = self.gym.create_box(
             self.sim, 0.5, 1.4, 0.01, box_asset_options
         )
@@ -1676,6 +2157,9 @@ class IsaacGymEnv(VecEnv):
         )
         box_asset_3 = self.gym.create_box(
             self.sim, 0.5, 0.05, 0.6, box_asset_options
+        )
+        box_asset_4 = self.gym.create_box(
+            self.sim, 0.3, 0.3, 0.3, box_asset_options
         )
 
         if not hasattr(self.cfg.domain_rand, "randomize_restitution_rigid_bodies"):
@@ -1848,7 +2332,7 @@ class IsaacGymEnv(VecEnv):
             self.env_spacing,
         )
         self.actor_handles = []
-        self.box_handles = []  # 添加box actor句柄列表，每个环境3个box
+        self.box_handles = []  # 添加box actor句柄列表，每个环境4个box
         self.envs = []
 
         for i in range(self.num_envs):
@@ -1885,11 +2369,11 @@ class IsaacGymEnv(VecEnv):
                 env_handle, actor_handle, body_props, recomputeInertia=True
             )
             
-            # 创建3个box actors
+            # 创建4个box actors
             box_handles_env = []
             
             # Box 1: 大box (0.5x0.7x0.05) - 在机器人前方
-            box1_offset = gymapi.Vec3(2.0, 0.0, 0.6)
+            box1_offset = gymapi.Vec3(4.0, 0.0, 0.6)
             # box1_offset = gymapi.Vec3(2.0, 0.0, 2.0)
             box1_pose = gymapi.Transform()
             box1_pose.p = start_pose.p + box1_offset
@@ -1906,7 +2390,7 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 2: 小box (0.05x0.05x0.6) - 在机器人左侧
-            box2_offset = gymapi.Vec3(2.0, -0.7, 0.3)
+            box2_offset = gymapi.Vec3(4.0, -0.7, 0.3)
             # box2_offset = gymapi.Vec3(2.0, -0.35, 2.0)
             box2_pose = gymapi.Transform()
             box2_pose.p = start_pose.p + box2_offset
@@ -1923,7 +2407,7 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 3: 小box (0.05x0.05x0.6) - 在机器人右侧
-            box3_offset = gymapi.Vec3(2.0, 0.7, 0.3)
+            box3_offset = gymapi.Vec3(4.0, 0.7, 0.3)
             # box3_offset = gymapi.Vec3(2.0, 0.35, 2.0)
             box3_pose = gymapi.Transform()
             box3_pose.p = start_pose.p + box3_offset
@@ -1939,14 +2423,31 @@ class IsaacGymEnv(VecEnv):
                 0,  # collision filter
             )
             
+            # Box 4: 小box (0.3x0.3x0.3) - 放在机器人前方的地上
+            box4_offset = gymapi.Vec3(2.0, 0.0, 1.0)  # 高度为0.3的一半，放在地上
+            box4_pose = gymapi.Transform()
+            box4_pose.p = start_pose.p + box4_offset
+            box4_pose.r = start_pose.r
+            
+            box4_handle = self.gym.create_actor(
+                env_handle,
+                box_asset_4,
+                box4_pose,
+                f"box4_{i}",
+                i,
+                0,  # collision group
+                0,  # collision filter
+            )
+
             # 设置box颜色
             colors = [
                 gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box1
                 gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box2
                 gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box3
+                gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box4
             ]
             
-            for j, (box_handle, color) in enumerate(zip([box1_handle, box2_handle, box3_handle], colors)):
+            for j, (box_handle, color) in enumerate(zip([box1_handle, box2_handle, box3_handle, box4_handle], colors)):
                 self.gym.set_rigid_body_color(
                     env_handle, box_handle, 0, 
                     gymapi.MESH_VISUAL_AND_COLLISION, color
@@ -2050,7 +2551,7 @@ class IsaacGymEnv(VecEnv):
         self.state.prev_dof_vel[env_ids] = 0.0
 
         # env_ids_int32 就是 actor indice 
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         env_ids_int32 = (env_ids * num_actors_per_env).to(dtype=torch.int32)
         # env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
@@ -2068,25 +2569,27 @@ class IsaacGymEnv(VecEnv):
             len(env_ids_int32),
         )
 
-    def _reset_box_states_in_root_state(self, env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids):
-        """在root_state中重置3个box物体的位置和状态"""
+    def _reset_box_states_in_root_state(self, env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids, box4_actor_ids):
+        """在root_state中重置4个box物体的位置和状态"""
+        num_actors_per_env = 5
         for i, env_id in enumerate(env_ids):
             if env_id < len(self.box_handles):
                 # 获取机器人的位置（世界坐标）
-                robot_actor_id = env_id * 4
+                robot_actor_id = env_id * num_actors_per_env  # 修正：每个环境有5个actor
                 robot_pos = self.state.root_state[robot_actor_id, 0:3]
                 
-                # 定义3个box的偏移位置
+                # 定义4个box的偏移位置
                 box_offsets = [
-                    torch.tensor([2.0, 0.0, 0.6], device=self.device),   # box1: 前方
-                    torch.tensor((2.0, -0.7, 0.3), device=self.device),  # box2: 左侧
-                    torch.tensor([2.0, 0.7, 0.3], device=self.device),   # box3: 右侧
+                    torch.tensor([4.0, 0.0, 0.6], device=self.device),   # box1: 前方
+                    torch.tensor((4.0, -0.7, 0.3), device=self.device),  # box2: 左侧
+                    torch.tensor([4.0, 0.7, 0.3], device=self.device),   # box3: 右侧
+                    torch.tensor([2.0, 0.0, 0.15], device=self.device),   # box4: 前方
                     # torch.tensor([2.0, 0.0, 2.0], device=self.device),   # box1: 前方
                     # torch.tensor([2.0, -0.35, 2.0], device=self.device),  # box2: 左侧
                     # torch.tensor([2.0, 0.35, 2.0], device=self.device),   # box3: 右侧
                 ]
                 
-                box_actor_ids = [box1_actor_ids[i], box2_actor_ids[i], box3_actor_ids[i]]
+                box_actor_ids = [box1_actor_ids[i], box2_actor_ids[i], box3_actor_ids[i], box4_actor_ids[i]]
                 
                 # 重置每个box
                 for box_actor_id, box_offset in zip(box_actor_ids, box_offsets):
@@ -2104,11 +2607,12 @@ class IsaacGymEnv(VecEnv):
     def _reset_box_states(self, env_ids):
         """重置box物体的位置和状态（旧方法，保留兼容性）"""
         # 这个方法现在调用新的方法
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         box1_actor_ids = env_ids * num_actors_per_env + 1
         box2_actor_ids = env_ids * num_actors_per_env + 2
         box3_actor_ids = env_ids * num_actors_per_env + 3
-        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids)
+        box4_actor_ids = env_ids * num_actors_per_env + 4
+        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids, box4_actor_ids)
 
     def _get_heights(self, env_ids=None):
         """Samples heights of the terrain at required points around each robot.

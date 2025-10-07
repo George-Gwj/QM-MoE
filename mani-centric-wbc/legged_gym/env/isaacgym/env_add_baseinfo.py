@@ -409,7 +409,7 @@ class IsaacGymEnv(VecEnv):
             self.global_step % self.cfg.domain_rand.push_interval == 0
         ):
             """Random pushes the robots. Emulates an impulse by setting a randomized base velocity."""
-            num_actors_per_env = 4
+            num_actors_per_env = 5
             robot_actor_ids = torch.arange(0, self.num_envs * num_actors_per_env, num_actors_per_env, device=self.device)
             self.state.root_state[robot_actor_ids, 7:13] = torch_rand_float(
                 -self.cfg.domain_rand.max_push_vel,
@@ -425,7 +425,7 @@ class IsaacGymEnv(VecEnv):
             self.global_step % self.cfg.domain_rand.transport_interval == 0
         ):
             """Randomly transports the robots to a new location"""
-            num_actors_per_env = 4
+            num_actors_per_env = 5
             robot_actor_ids = torch.arange(0, self.num_envs * num_actors_per_env, num_actors_per_env, device=self.device)
             self.state.root_state[robot_actor_ids, 0:3] += (
                 torch.randn(
@@ -506,7 +506,7 @@ class IsaacGymEnv(VecEnv):
             self.episode_step > self.max_episode_length
         )  # no terminal reward for time-outs
         # also reset if robot walks off the safe bounds
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         walked_off_safe_bounds = torch.logical_or(
             (self.state.root_pos[::num_actors_per_env, :2] < self.safe_bounds[None, :, 0]).any(dim=1),
             (self.state.root_pos[::num_actors_per_env, :2] > self.safe_bounds[None, :, 1]).any(dim=1),
@@ -629,7 +629,7 @@ class IsaacGymEnv(VecEnv):
         setup_obs: Dict[str, EnvSetupAttribute],
     ):
         obs_attrs = []
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         for name, obs_attr in state_obs.items():
             value = obs_attr(struct=state, generator=self.generator)
             if name == "root_ang_vel":
@@ -883,8 +883,8 @@ class IsaacGymEnv(VecEnv):
         return props
 
     def _reset_root_states(self, env_ids):
-        # 计算机器人actor的索引（每4个actor一组：机器人, box1, box2, box3）
-        num_actors_per_env = 4
+        # 计算机器人actor的索引（每5个actor一组：机器人, box1, box2, box3, box4）
+        num_actors_per_env = 5
         robot_actor_ids = env_ids * num_actors_per_env
         
         # 重置机器人状态
@@ -928,19 +928,21 @@ class IsaacGymEnv(VecEnv):
             )
         self.state.root_state[robot_actor_ids, :3] += self.env_origins[env_ids]
         
-        # 重置3个box状态
-        box1_actor_ids = env_ids * 4 + 1  # box1索引
-        box2_actor_ids = env_ids * 4 + 2  # box2索引
-        box3_actor_ids = env_ids * 4 + 3  # box3索引
-        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids)
+        # 重置4个box状态
+        box1_actor_ids = env_ids * num_actors_per_env + 1  # box1索引
+        box2_actor_ids = env_ids * num_actors_per_env + 2  # box2索引
+        box3_actor_ids = env_ids * num_actors_per_env + 3  # box3索引
+        box4_actor_ids = env_ids * num_actors_per_env + 4  # box4索引
+        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids, box4_actor_ids)
         
-        # 设置所有actor的状态（包括机器人和3个box）
+        # 设置所有actor的状态（包括机器人和4个box）
         # 创建包含机器人和所有box的actor索引
         all_actor_ids = torch.cat([
             robot_actor_ids,    # 机器人actor索引
             box1_actor_ids,     # box1 actor索引
             box2_actor_ids,     # box2 actor索引
-            box3_actor_ids      # box3 actor索引
+            box3_actor_ids,     # box3 actor索引
+            box4_actor_ids      # box4 actor索引
         ]).to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
@@ -1012,7 +1014,7 @@ class IsaacGymEnv(VecEnv):
         box_asset_options.density = 1000.0  # 水的密度
         box_asset_options.fix_base_link = True  # 设置为固定基座
         
-        # 创建3个不同尺寸的box
+        # 创建4个不同尺寸的box
         box_asset_1 = self.gym.create_box(
             self.sim, 0.5, 0.7, 0.05, box_asset_options
         )
@@ -1022,6 +1024,10 @@ class IsaacGymEnv(VecEnv):
         box_asset_3 = self.gym.create_box(
             self.sim, 0.5, 0.05, 0.6, box_asset_options
         )
+        box_asset_4 = self.gym.create_box(
+            self.sim, 0.3, 0.3, 0.3, box_asset_options
+        )
+
 
         if not hasattr(self.cfg.domain_rand, "randomize_restitution_rigid_bodies"):
             self.cfg.domain_rand.randomize_restitution_rigid_bodies = []
@@ -1193,7 +1199,7 @@ class IsaacGymEnv(VecEnv):
             self.env_spacing,
         )
         self.actor_handles = []
-        self.box_handles = []  # 添加box actor句柄列表，每个环境3个box
+        self.box_handles = []  # 添加box actor句柄列表，每个环境4个box
         self.envs = []
 
         for i in range(self.num_envs):
@@ -1230,12 +1236,12 @@ class IsaacGymEnv(VecEnv):
                 env_handle, actor_handle, body_props, recomputeInertia=True
             )
             
-            # 创建3个box actors
+            # 创建4个box actors
             box_handles_env = []
             
             # Box 1: 大box (0.5x0.7x0.05) - 在机器人前方
-            # box1_offset = gymapi.Vec3(2.0, 0.0, 0.3)
-            box1_offset = gymapi.Vec3(2.0, 0.0, 2.0)
+            box1_offset = gymapi.Vec3(3.0, 0.0, 0.6)
+            # box1_offset = gymapi.Vec3(2.0, 0.0, 2.0)
             box1_pose = gymapi.Transform()
             box1_pose.p = start_pose.p + box1_offset
             box1_pose.r = start_pose.r
@@ -1251,8 +1257,8 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 2: 小box (0.05x0.05x0.6) - 在机器人左侧
-            # box2_offset = gymapi.Vec3(2.0, -0.35, 0.0)
-            box2_offset = gymapi.Vec3(2.0, -0.35, 2.0)
+            box2_offset = gymapi.Vec3(3.0, -0.7, 0.3)
+            # box2_offset = gymapi.Vec3(2.0, -0.35, 2.0)
             box2_pose = gymapi.Transform()
             box2_pose.p = start_pose.p + box2_offset
             box2_pose.r = start_pose.r
@@ -1268,8 +1274,8 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 3: 小box (0.05x0.05x0.6) - 在机器人右侧
-            # box3_offset = gymapi.Vec3(2.0, 0.35, 0.0)
-            box3_offset = gymapi.Vec3(2.0, 0.35, 2.0)
+            box3_offset = gymapi.Vec3(3.0, 0.7, 0.3)
+            # box3_offset = gymapi.Vec3(2.0, 0.35, 2.0)
             box3_pose = gymapi.Transform()
             box3_pose.p = start_pose.p + box3_offset
             box3_pose.r = start_pose.r
@@ -1284,14 +1290,31 @@ class IsaacGymEnv(VecEnv):
                 0,  # collision filter
             )
             
+            box4_offset = gymapi.Vec3(1.0, 0.0, 0.15)
+            box4_pose = gymapi.Transform()
+            box4_pose.p = start_pose.p + box4_offset
+            box4_pose.r = start_pose.r
+            
+            box4_handle = self.gym.create_actor(
+                env_handle,
+                box_asset_4,
+                box4_pose,
+                f"box4_{i}",
+                i,
+                0,  # collision group
+                0,  # collision filter
+            )
+
+
             # 设置box颜色
             colors = [
                 gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box1
                 gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box2
                 gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box3
+                gymapi.Vec3(1.0, 1.0, 1.0),  # 白色 - box4
             ]
             
-            for j, (box_handle, color) in enumerate(zip([box1_handle, box2_handle, box3_handle], colors)):
+            for j, (box_handle, color) in enumerate(zip([box1_handle, box2_handle, box3_handle, box4_handle], colors)):
                 self.gym.set_rigid_body_color(
                     env_handle, box_handle, 0, 
                     gymapi.MESH_VISUAL_AND_COLLISION, color
@@ -1395,7 +1418,7 @@ class IsaacGymEnv(VecEnv):
         self.state.prev_dof_vel[env_ids] = 0.0
 
         # env_ids_int32 就是 actor indice 
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         env_ids_int32 = (env_ids * num_actors_per_env).to(dtype=torch.int32)
         # env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
@@ -1413,25 +1436,26 @@ class IsaacGymEnv(VecEnv):
             len(env_ids_int32),
         )
 
-    def _reset_box_states_in_root_state(self, env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids):
-        """在root_state中重置3个box物体的位置和状态"""
+    def _reset_box_states_in_root_state(self, env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids, box4_actor_ids):
+        """在root_state中重置4个box物体的位置和状态"""
         for i, env_id in enumerate(env_ids):
             if env_id < len(self.box_handles):
                 # 获取机器人的位置（世界坐标）
-                robot_actor_id = env_id * 4
+                robot_actor_id = env_id * 5  # 修正：每个环境有5个actor
                 robot_pos = self.state.root_state[robot_actor_id, 0:3]
                 
-                # 定义3个box的偏移位置
+                # 定义4个box的偏移位置
                 box_offsets = [
-                    # torch.tensor([2.0, 0.0, 0.3], device=self.device),   # box1: 前方
-                    # torch.tensor((2.0, -0.35, 0.0), device=self.device),  # box2: 左侧
-                    # torch.tensor([2.0, 0.35, 0.0], device=self.device),   # box3: 右侧
-                    torch.tensor([2.0, 0.0, 2.0], device=self.device),   # box1: 前方
-                    torch.tensor([2.0, -0.35, 2.0], device=self.device),  # box2: 左侧
-                    torch.tensor([2.0, 0.35, 2.0], device=self.device),   # box3: 右侧
+                    torch.tensor([3.0, 0.0, 0.6], device=self.device),   # box1: 前方
+                    torch.tensor([3.0, -0.7, 0.3], device=self.device),  # box2: 左侧
+                    torch.tensor([3.0, 0.7, 0.3], device=self.device),   # box3: 右侧
+                    torch.tensor([1.0, 0.0, 0.15], device=self.device),   # box4: 前方
+                    # torch.tensor([2.0, 0.0, 2.0], device=self.device),   # box1: 前方
+                    # torch.tensor([2.0, -0.35, 2.0], device=self.device),  # box2: 左侧
+                    # torch.tensor([2.0, 0.35, 2.0], device=self.device),   # box3: 右侧
                 ]
                 
-                box_actor_ids = [box1_actor_ids[i], box2_actor_ids[i], box3_actor_ids[i]]
+                box_actor_ids = [box1_actor_ids[i], box2_actor_ids[i], box3_actor_ids[i], box4_actor_ids[i]]
                 
                 # 重置每个box
                 for box_actor_id, box_offset in zip(box_actor_ids, box_offsets):
@@ -1449,11 +1473,12 @@ class IsaacGymEnv(VecEnv):
     def _reset_box_states(self, env_ids):
         """重置box物体的位置和状态（旧方法，保留兼容性）"""
         # 这个方法现在调用新的方法
-        num_actors_per_env = 4
+        num_actors_per_env = 5
         box1_actor_ids = env_ids * num_actors_per_env + 1
         box2_actor_ids = env_ids * num_actors_per_env + 2
         box3_actor_ids = env_ids * num_actors_per_env + 3
-        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids)
+        box4_actor_ids = env_ids * num_actors_per_env + 4
+        self._reset_box_states_in_root_state(env_ids, box1_actor_ids, box2_actor_ids, box3_actor_ids, box4_actor_ids)
 
     def _get_heights(self, env_ids=None):
         """Samples heights of the terrain at required points around each robot.
