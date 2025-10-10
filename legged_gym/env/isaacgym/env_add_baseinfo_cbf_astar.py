@@ -31,33 +31,6 @@ from cbf.cbf_controller import CBF_controller, DISTURBANCE_OBSERVER
 from multiprocessing import Process, Queue
 import casadi as ca
 import heapq
-from scipy.spatial.transform import Rotation as R
-
-class RRTTree:
-    """RRT树数据结构"""
-    
-    def __init__(self):
-        self.nodes = []
-        
-    def add_node(self, node):
-        self.nodes.append(node)
-        
-    def find_node_by_config(self, config, tolerance=1e-3):
-        """通过配置找到节点"""
-        for node in self.nodes:
-            if all(abs(a - b) < tolerance for a, b in zip(node.config, config)):
-                return node
-        return None
-
-class RRTNode:
-    """RRT树节点"""
-    
-    def __init__(self, config, layer_idx, base_pose, cost=0.0):
-        self.config = config  # 机械臂配置
-        self.layer_idx = layer_idx  # 层索引（对应基座路径点）
-        self.base_pose = base_pose  # 基座位姿 (x, y, yaw)
-        self.cost = cost  # 从起点到该节点的代价
-        self.parent = None  # 父节点
 
 
 class ParallelAStarPlanner:
@@ -69,1154 +42,11 @@ class ParallelAStarPlanner:
         self.safety_margin = 0.05 # 安全裕度（米）
         # 障碍物位置和尺寸 (x, y, width, length, height)
         self.obstacles = [
-            (4.0, -0.7, 0.5, 0.05, 0.7),   # box2: 左侧障碍物
-            (4.0, 0.7, 0.5, 0.05, 0.7),    # box3: 右侧障碍物  
+            (4.0, -0.7, 0.5, 0.05, 0.6),   # box2: 左侧障碍物
+            (4.0, 0.7, 0.5, 0.05, 0.6),    # box3: 右侧障碍物  
             (2.0, 0.0, 0.3, 0.3, 0.3),     # box4: 前方障碍物
         ]
-
-        self.obstacles_rrt = [
-            (4.0, 0.0, 0.7, 0.5, 1.4, 0.05),   # box1: 前方障碍物 (x, y, z, length_x, length_y, length_z)
-            (4.0, -0.7, 0.35, 0.5, 0.05, 0.6),   # box2: 左侧障碍物 (修正高度: 0.6)
-            (4.0, 0.7, 0.35, 0.5, 0.05, 0.6),    # box3: 右侧障碍物 (修正高度: 0.6)
-            (2.0, 0.0, 0.15, 0.3, 0.3, 0.3),     # box4: 前方障碍物
-        ]
     
-
-        # 机械臂参数
-        self.arm_dofs = 5  # 机械臂自由度数量
-        self.arm_joint_limits = [
-            (-2.68, 2.68),   # 关节1限制
-            (0.0, 3.14),   # 关节2限制  
-            (-2.697, 0.0),   # 关节3限制
-            (-1.832, 1.832),   # 关节4限制
-            (-1.22, 1.22)    # 关节5限制
-        ]
-
-
-    def multilayer_rrt_connect(self, base_path, start_arm_config, goal_arm_config, 
-                             max_iterations=1000, step_size=0.1, connection_attempts=3):
-        """
-        多层约束 RRT-Connect 算法（简化版，不带RRT*优化）
-        """
-        print("开始多层RRT-Connect路径规划...")
-        
-        # 先测试一个简单的机械臂配置
-        test_base_pose = (0.1, 0.0, 0.0)
-        test_arm_config = [0.0, 0.0, 0.0, 0.0, 0.0]
-        print(f"测试配置: 基座{test_base_pose}, 机械臂{test_arm_config}")
-        self.debug_arm_position(test_base_pose, test_arm_config)
-        
-        # 初始化两棵树
-        tree_a = RRTTree()
-        tree_b = RRTTree()
-        
-        start_node = RRTNode(config=start_arm_config, layer_idx=0, 
-                           base_pose=base_path[0], cost=0.0)
-        goal_node = RRTNode(config=goal_arm_config, layer_idx=len(base_path)-1,
-                          base_pose=base_path[-1], cost=0.0)
-        
-        tree_a.add_node(start_node)
-        tree_b.add_node(goal_node)
-        
-        for iteration in range(max_iterations):
-            if iteration % 100 == 0:
-                print(f"RRT-Connect 迭代: {iteration}/{max_iterations}")
-                print(f"  - TreeA节点数: {len(tree_a.nodes)}, TreeB节点数: {len(tree_b.nodes)}")
-                
-            # 交替扩展两棵树
-            if iteration % 2 == 0:
-                growing_tree, target_tree = tree_a, tree_b
-            else:
-                growing_tree, target_tree = tree_b, tree_a
-                
-            # EXTEND 过程
-            new_node = self.extend(growing_tree, base_path, step_size, tree_a, tree_b, is_tree_a=(iteration % 2 == 0))
-            
-            if new_node:
-                print(f"  扩展成功: 层{new_node.layer_idx}")
-                if self.is_configuration_valid(new_node.config, new_node.base_pose):
-                    print(f"  配置有效")
-                # CONNECT 过程
-                connected = self.connect_trees_simple(growing_tree, target_tree, new_node, 
-                                                    base_path, step_size)
-                
-                if connected:
-                    print(f"成功连接两棵树! 总迭代次数: {iteration}")
-                    print(f"  连接节点: 层{new_node.layer_idx}, 基座{new_node.base_pose}, 配置{new_node.config}")
-                    # 重建完整路径
-                    if iteration % 2 == 0:
-                        path = self.reconstruct_full_path(tree_a, tree_b, new_node, base_path)
-                    else:
-                        path = self.reconstruct_full_path(tree_b, tree_a, new_node, base_path)
-                        print(f"  重建路径长度: {len(path) if path else 0}")
-                    return path
-                else:
-                    print(f"  配置无效（碰撞检测失败）")
-            else:
-                print(f"  扩展失败")
-                    
-            # # 检查是否在狭窄环境中受阻
-            # if iteration % 200 == 0 and iteration > 100:
-            #     if self.is_stuck_in_narrow_passage(tree_a, tree_b, base_path):
-            #         print("检测到狭窄通道，启动局部全身路径搜索...")
-            #         local_path = self.local_whole_body_search(tree_a, tree_b, base_path)
-            #         if local_path:
-            #             full_path = self.merge_local_path(tree_a, tree_b, local_path, base_path)
-            #             return self.smooth_full_path(full_path)
-    
-
-        return None
-
-    def extend(self, tree, base_path, step_size, tree_a, tree_b, is_tree_a=True):
-        """
-        扩展过程 - 区分 TreeA 和 TreeB 的扩展方向
-        """
-        random_config = self.sample_random_config()
-        random_layer = self.sample_random_layer(base_path,tree_a, tree_b, is_tree_a)
-        
-        print(f"  随机采样: 层{random_layer}, 配置{random_config}")
-        
-        nearest_node = self.find_nearest_node(tree, random_config, random_layer, is_tree_a)
-        if nearest_node is None:
-            print(f"  find_nearest_node返回None")
-            return None
-        
-        print(f"  找到最近节点: 层{nearest_node.layer_idx}, 配置{nearest_node.config}")
-        
-        # TreeA 向层索引增加方向扩展，TreeB 向层索引减小方向扩展
-        if is_tree_a:
-            new_layer = nearest_node.layer_idx + 1  # TreeA: 向前扩展
-        else:
-            new_layer = nearest_node.layer_idx - 1  # TreeB: 向后扩展
-        
-        # 检查层边界
-        if new_layer < 0 or new_layer >= len(base_path):
-            print(f"  层边界检查失败: new_layer={new_layer}, base_path长度={len(base_path)}")
-            return None
-            
-        new_config = self.steer(nearest_node.config, random_config, step_size)
-        print(f"  步进后配置: {new_config}")
-        
-        if not self.is_configuration_valid(new_config, base_path[new_layer]):
-            print(f"  配置无效: {new_config}, 基座位置: {base_path[new_layer]}")
-            return None
-            
-        new_node = RRTNode(config=new_config, layer_idx=new_layer,
-                        base_pose=base_path[new_layer], 
-                        cost=nearest_node.cost + self.distance(nearest_node.config, new_config))
-        new_node.parent = nearest_node
-        tree.add_node(new_node)
-        
-        return new_node
-
-    def count_nodes_at_layer(self, tree, layer_idx):
-        """统计指定层的节点数量"""
-        return sum(1 for node in tree.nodes if node.layer_idx == layer_idx)
-
-    def connect_trees_simple(self, tree_a, tree_b, new_node, base_path, step_size):
-        """
-        改进的连接检查
-        """
-        # 在目标树中找到相同层或相邻层的最近节点
-        nearest_in_b = None
-        min_distance = float('inf')
-        
-        for node in tree_b.nodes:
-            # 允许连接相同层或相邻层
-            layer_diff = abs(node.layer_idx - new_node.layer_idx)
-            if layer_diff <= 1:  # 相同层或相邻层
-                distance = self.distance(node.config, new_node.config)
-                if distance < min_distance:
-                    min_distance = distance
-                    nearest_in_b = node
-        
-        if nearest_in_b is None:
-            return False
-            
-        # 检查配置是否接近且有效
-        if (min_distance < 0.2 and  # 配置距离阈值
-            self.is_configuration_valid(nearest_in_b.config, nearest_in_b.base_pose)):
-            
-            # 连接成功 - 不修改父节点关系，只标记连接
-            print(f"成功连接! 层{new_node.layer_idx}, 距离{min_distance:.3f}")
-            # 存储连接信息用于路径重建
-            new_node.connection_node = nearest_in_b
-            return True
-            
-        return False
-
-    def is_stuck_in_narrow_passage(self, tree_a, tree_b, base_path):
-        """
-        检查是否在狭窄通道中受阻（改进版）
-        """
-        # 计算两棵树的最大探索层
-        max_layer_a = max([node.layer_idx for node in tree_a.nodes]) if tree_a.nodes else 0
-        min_layer_b = min([node.layer_idx for node in tree_b.nodes]) if tree_b.nodes else len(base_path)-1
-        
-        # 如果两棵树的最大层之间有较大间隔，说明受阻
-        layer_gap = min_layer_b - max_layer_a
-        if layer_gap > 3:  # 如果间隔超过3层
-            print(f"检测到狭窄通道：TreeA最大层={max_layer_a}, TreeB最小层={min_layer_b}, 间隔={layer_gap}")
-            return True
-            
-        # 如果两棵树都有一定规模但长时间无法连接，认为受阻
-        if len(tree_a.nodes) > 50 and len(tree_b.nodes) > 50:
-            # 计算两棵树最近节点之间的距离
-            min_distance = float('inf')
-            for node_a in tree_a.nodes:
-                for node_b in tree_b.nodes:
-                    if node_a.layer_idx == node_b.layer_idx:
-                        dist = self.distance(node_a.config, node_b.config)
-                        if dist < min_distance:
-                            min_distance = dist
-            
-            # 如果最近距离很小但仍无法连接，说明可能在狭窄通道
-            if min_distance < 0.3:
-                print(f"检测到狭窄通道：最近节点距离={min_distance:.3f}")
-                return True
-                
-        return False
-
-    def merge_local_path(self, tree_a, tree_b, local_path, base_path):
-        """
-        合并局部路径到全局路径
-        """
-        if not local_path:
-            return None
-            
-        # 重建完整路径
-        full_path = []
-        
-        # 从树A到局部路径起点
-        start_state = local_path[0]
-        start_node = tree_a.find_node_by_config(start_state[3:])  # 找到对应的机械臂配置
-        if start_node:
-            path_from_start = []
-            current = start_node
-            while current:
-                full_state = current.base_pose + tuple(current.config)
-                path_from_start.append(full_state)
-                current = current.parent
-            path_from_start.reverse()
-            full_path.extend(path_from_start)
-        
-        # 添加局部路径（去掉重复的起点）
-        full_path.extend(local_path[1:])
-        
-        # 从局部路径终点到树B
-        end_state = local_path[-1]
-        end_node = tree_b.find_node_by_config(end_state[3:])
-        if end_node:
-            path_to_goal = []
-            current = end_node
-            while current:
-                full_state = current.base_pose + tuple(current.config)
-                path_to_goal.append(full_state)
-                current = current.parent
-            # 不需要反转，因为是从终点回溯
-            full_path.extend(path_to_goal[1:])  # 避免重复终点
-            
-        return full_path
-
-    # 其他辅助方法保持不变...
-    def is_configuration_valid(self, arm_config, base_pose):
-        """检查机械臂配置在给定基座位姿下是否有效"""
-        # 检查关节限制
-        for i, joint_value in enumerate(arm_config):
-            if not (self.arm_joint_limits[i][0] <= joint_value <= self.arm_joint_limits[i][1]):
-                return False
-                
-        # 使用碰撞检测
-        return self.check_arm_collision(arm_config, base_pose)
-
-    def check_arm_collision(self, arm_config, base_pose):
-        """检查机械臂是否与环境障碍物碰撞（基于CBF的碰撞检测）"""
-        try:
-            # 检查关节限制
-            for i, joint_value in enumerate(arm_config):
-                if not (self.arm_joint_limits[i][0] <= joint_value <= self.arm_joint_limits[i][1]):
-                    print(f"关节{i}超出限制: {joint_value} 不在 [{self.arm_joint_limits[i][0]}, {self.arm_joint_limits[i][1]}]")
-                    return False
-            
-            # 重新启用碰撞检测
-            print(f"启用碰撞检测，基座位置: {base_pose}, 机械臂配置: {arm_config}")
-            return self._cbf_collision_check(arm_config, base_pose)
-            
-        except Exception as e:
-            print(f"碰撞检测出错: {e}")
-            return False  # 出错时保守地认为有碰撞
-    
-    def debug_arm_position(self, base_pose, arm_config):
-        """调试机械臂位置计算"""
-        print(f"=== 调试机械臂位置 ===")
-        print(f"基座位置: {base_pose}")
-        print(f"机械臂配置: {arm_config}")
-        
-        try:
-            arm_points = self._compute_arm_kinematics_numeric(base_pose, arm_config)
-            print(f"机械臂关节位置:")
-            for i, point in enumerate(arm_points):
-                print(f"  关节{i}: ({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})")
-            
-            # 检查是否与障碍物碰撞
-            box_obstacles = self._get_environment_obstacles()
-            print(f"障碍物信息:")
-            for i, box in enumerate(box_obstacles):
-                print(f"  障碍物{i}: 中心{box['center']}, 尺寸{box['dimensions']}")
-            
-            min_distance = self._compute_min_distance_to_obstacles_numeric(arm_points, box_obstacles)
-            print(f"最小距离: {min_distance:.3f}m")
-            
-            # 检查每个关节是否在障碍物内
-            for i, point in enumerate(arm_points):
-                for j, box in enumerate(box_obstacles):
-                    center = box['center']
-                    dimensions = box['dimensions']
-                    
-                    # 检查点是否在障碍物内
-                    dx = abs(point[0] - center[0])
-                    dy = abs(point[1] - center[1])
-                    dz = abs(point[2] - center[2])
-                    
-                    if dx <= dimensions[0]/2 and dy <= dimensions[1]/2 and dz <= dimensions[2]/2:
-                        print(f"  ⚠️ 关节{i}在障碍物{j}内!")
-                        print(f"    关节位置: ({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})")
-                        print(f"    障碍物中心: ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})")
-                        print(f"    障碍物尺寸: ({dimensions[0]:.3f}, {dimensions[1]:.3f}, {dimensions[2]:.3f})")
-            
-        except Exception as e:
-            print(f"调试出错: {e}")
-        
-        print(f"=== 调试完成 ===")
-
-    def _cbf_collision_check(self, arm_config, base_pose):
-        """基于CBF的精确碰撞检测实现"""
-        try:
-            # 使用数值版本的运动学计算
-            arm_points = self._compute_arm_kinematics_numeric(base_pose, arm_config)
-
-            
-            # 获取环境中的长方体障碍物
-            box_obstacles = self._get_environment_obstacles()
-            
-            # 计算到障碍物的最小距离
-            min_distance = self._compute_min_distance_to_obstacles_numeric(arm_points, box_obstacles)
-            
-            # 安全距离阈值 - 增加阈值使其更宽松
-            safety_threshold = 0.01  # 增加到10cm安全距离
-            
-            is_safe = min_distance > safety_threshold
-            
-            print(f"碰撞检测结果: 距离{min_distance:.3f}m, 阈值{safety_threshold}m, 安全: {is_safe}")
-            
-            if not is_safe:
-                print(f"碰撞检测: 距离{min_distance:.3f}m < 阈值{safety_threshold}m")
-                # 添加详细调试
-                self.debug_arm_position(base_pose, arm_config)
-            
-            return is_safe
-            
-        except Exception as e:
-            print(f"碰撞检测出错: {e}")
-            return False  # 出错时保守地认为有碰撞
-    
-    def _compute_arm_kinematics_numeric(self, base_posture, piper_angles):
-        """数值版本的运动学计算（基于CBF的精确DH参数）"""
-        try:
-            # 基座位置和旋转
-            base_x, base_y, base_yaw = base_posture
-            
-            # 创建基座变换矩阵
-            cos_yaw = np.cos(base_yaw)
-            sin_yaw = np.sin(base_yaw)
-            
-            # 基座变换矩阵 - 先旋转再平移
-            T_yaw = np.eye(4)
-            T_yaw[0, 0] = cos_yaw
-            T_yaw[0, 1] = -sin_yaw
-            T_yaw[1, 0] = sin_yaw
-            T_yaw[1, 1] = cos_yaw
-            
-            # 平移矩阵
-            T_translation = np.eye(4)
-            T_translation[0, 3] = base_x
-            T_translation[1, 3] = base_y
-            T_translation[2, 3] = 0.26
-            
-            T_world_base = T_translation @ T_yaw
-            
-            # 机械臂关节角度
-            cos_0, cos_1, cos_2, cos_3, cos_4 = (np.cos(piper_angles[0]),
-                                                np.cos(piper_angles[1]),
-                                                np.cos(piper_angles[2]),
-                                                np.cos(piper_angles[3]),
-                                                np.cos(piper_angles[4]))
-            
-            sin_0, sin_1, sin_2, sin_3, sin_4 = (np.sin(piper_angles[0]),
-                                                np.sin(piper_angles[1]),
-                                                np.sin(piper_angles[2]),
-                                                np.sin(piper_angles[3]),
-                                                np.sin(piper_angles[4]))
-            
-            # 机械臂各关节变换矩阵（基于CBF的精确参数）
-            # 第一段 base-> J1
-            T_base_A0 = np.array([[1., 0., 0., 0.],
-                                 [0., 1., 0., 0.],
-                                 [0., 0., 1., 0.074],
-                                 [0., 0., 0., 1.]])
-            T_A0_A = np.array([[cos_0, -sin_0, 0., 0.],
-                              [sin_0, cos_0, 0., 0.],
-                              [0., 0., 1., 0.],
-                              [0., 0., 0., 1.]])
-            T_base_A = T_base_A0 @ T_A0_A
-            
-            # 第二段 J1->J2
-            T_A_B0 = np.array([[1.0, 0.0, 0.0, 0.00],
-                              [0.0, 1.0, 0.0, 0.0],
-                              [0.0, 0.0, 1.0, 0.049],
-                              [0., 0., 0., 1.]])
-            T_B0_B = np.array([[cos_1, 0, sin_1, 0.],
-                              [0, 1, 0., 0.],
-                              [-sin_1, 0., cos_1, 0.],
-                              [0., 0., 0., 1.]])
-            T_A_B = T_A_B0 @ T_B0_B
-            
-            # 第三段 J2->J3
-            T_B_C0 = np.array([[1, 0, 0, -0.28],
-                              [0, 1, 0, 0.0],
-                              [0, 0, 1, 0.045],
-                              [0, 0, 0, 1]])
-            T_C0_C = np.array([[cos_2, 0, sin_2, 0.],
-                              [0, 1, 0., 0.],
-                              [-sin_2, 0., cos_2, 0.],
-                              [0., 0., 0., 1.]])
-            T_B_C = T_B_C0 @ T_C0_C
-            
-            # 第四段 J3->J4
-            T_C_D0 = np.array([[1, 0, 0, 0.22],
-                              [0, 1, 0, 0],
-                              [0, 0, 1, 0.025],
-                              [0, 0, 0, 1]])
-            T_D0_D = np.array([[1., 0., 0., 0.],
-                              [0., cos_3, -sin_3, 0.],
-                              [0., sin_3, cos_3, 0.],
-                              [0., 0., 0., 1.]])
-            T_C_D = T_C_D0 @ T_D0_D
-            
-            # 第五段 J4->J5
-            T_D_E0 = np.array([[1, 0, 0, 0.036],
-                              [0, 1, 0, 0.0],
-                              [0, 0, 1, 0],
-                              [0, 0, 0, 1]])
-            T_E0_E = np.array([[cos_4, 0, sin_4, 0.],
-                              [0, 1, 0., 0.],
-                              [-sin_4, 0., cos_4, 0.],
-                              [0., 0., 0., 1.]])
-            T_D_E = T_D_E0 @ T_E0_E
-            
-            # 第六段 J5->end_effector
-            T_E_F0 = np.array([[1, 0, 0, 0.236],
-                              [0, 1, 0, 0.0],
-                              [0, 0, 1, 0.0],
-                              [0, 0, 0, 1]])
-            T_E_END = T_E_F0
-            
-            # 计算各关节的世界坐标
-            BASE_T_BASE = np.eye(4)
-            BASE_T_A = T_world_base @ T_base_A @ BASE_T_BASE
-            BASE_T_B = T_world_base @ T_base_A @ T_A_B @ BASE_T_BASE
-            BASE_T_C = T_world_base @ T_base_A @ T_A_B @ T_B_C
-            BASE_T_D = T_world_base @ T_base_A @ T_A_B @ T_B_C @ T_C_D
-            BASE_T_E = T_world_base @ T_base_A @ T_A_B @ T_B_C @ T_C_D @ T_D_E
-            BASE_T_END = T_world_base @ T_base_A @ T_A_B @ T_B_C @ T_C_D @ T_D_E @ T_E_END
-            
-            # 提取位置向量
-            BASE = np.array([base_x, base_y, 0.26])
-            A = BASE_T_A[0:3, 3]
-            B = BASE_T_B[0:3, 3]
-            C = BASE_T_C[0:3, 3]
-            D = BASE_T_D[0:3, 3]
-            E = BASE_T_E[0:3, 3]
-            END = BASE_T_END[0:3, 3]
-            
-            # 组合所有关节位置
-            arm_points = np.column_stack([BASE, A, B, C, D, E, END])
-            
-            return arm_points.T  # 返回7x3的矩阵，每行是一个关节的3D坐标
-            
-        except Exception as e:
-            print(f"数值运动学计算出错: {e}")
-            # 返回默认的安全位置
-            return np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 
-                           [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
-            
-        except Exception as e:
-            print(f"数值距离计算出错: {e}")
-            return 0.0  # 出错时返回0，认为有碰撞
-    
-    def _compute_min_distance_to_obstacles_numeric(self, arm_points, box_obstacles):
-        """数值版本的障碍物距离计算（线段到长方体）"""
-        try:
-            min_distance = float('inf')
-            
-            # 计算机械臂各段
-            arm_segments = []
-            for i in range(len(arm_points) - 1):
-                arm_segments.append((arm_points[i], arm_points[i + 1]))
-            
-            # 对每个长方体障碍物计算距离
-            for box in box_obstacles:
-                # 对每个机械臂段计算到长方体的距离
-                for segment_start, segment_end in arm_segments:
-                    distance = self._distance_segment_to_box_numeric(
-                        segment_start, segment_end, box
-                    )
-                    min_distance = min(min_distance, distance)
-                    
-                    # 如果距离为0，直接返回，避免不必要的计算
-                    if min_distance <= 1e-6:
-                        return 0.0
-            
-            return min_distance if min_distance != float('inf') else 10.0  # 返回安全距离
-            
-        except Exception as e:
-            print(f"数值距离计算出错: {e}")
-            return 0.0
-
-    
-    def _distance_segment_to_box_numeric(self, P0, P1, box):
-        """线段到长方体距离计算 - 使用修正的AABB方法"""
-        try:
-            # 主要使用AABB方法，因为障碍物是轴对齐的
-            return self._distance_segment_to_aabb_numeric(P0, P1, box)
-            
-        except Exception as e:
-            print(f"线段到长方体距离计算出错: {e}")
-            return 0.0
-    
-    def _distance_segment_to_aabb_numeric(self, P0, P1, box):
-        """线段到AABB（轴对齐包围盒）的距离 - 修正版本"""
-        try:
-            center = box['center']
-            half_dims = box['half_dimensions']
-            
-            # AABB的边界
-            min_bounds = center - half_dims
-            max_bounds = center + half_dims
-            
-            # 计算线段上最近点到AABB的距离
-            closest_point = self._closest_point_on_segment_to_aabb(P0, P1, min_bounds, max_bounds)
-            
-            # 计算点到AABB的距离
-            distance = self._distance_point_to_aabb_numeric(closest_point, min_bounds, max_bounds)
-            
-            return distance
-            
-        except Exception as e:
-            print(f"AABB距离计算出错: {e}")
-            return 0.0
-    
-    def _closest_point_on_segment_to_aabb(self, P0, P1, min_bounds, max_bounds):
-        """修正的线段到AABB最近点计算"""
-        try:
-            segment_dir = P1 - P0
-            segment_length = np.linalg.norm(segment_dir)
-            
-            if segment_length < 1e-6:
-                return P0
-            
-            # 修正1：使用原始方向向量，而不是单位向量
-            t_min = 0.0
-            t_max = 1.0
-            
-            # 对每个轴进行裁剪
-            for i in range(3):
-                if abs(segment_dir[i]) > 1e-10:  # 避免除零
-                    # 计算与两个平面的交点参数
-                    t1 = (min_bounds[i] - P0[i]) / segment_dir[i]
-                    t2 = (max_bounds[i] - P0[i]) / segment_dir[i]
-                    
-                    # 确定进入和离开参数
-                    t_enter = min(t1, t2)
-                    t_exit = max(t1, t2)
-                    
-                    # 更新裁剪区间
-                    t_min = max(t_min, t_enter)
-                    t_max = min(t_max, t_exit)
-                else:
-                    # 线段平行于该轴，检查是否在边界外
-                    if P0[i] < min_bounds[i] or P0[i] > max_bounds[i]:
-                        # 线段完全在AABB外，无交点
-                        return self._closest_endpoint_to_aabb(P0, P1, min_bounds, max_bounds)
-            
-            # 修正2：改进的最近点选择逻辑
-            if t_min <= t_max:  # 线段与AABB相交或接触
-                if 0 <= t_min <= 1:
-                    # 使用进入点作为最近点
-                    t_closest = t_min
-                elif 0 <= t_max <= 1:
-                    # 使用离开点作为最近点
-                    t_closest = t_max
-                else:
-                    # 线段在AABB外部但参数区间有效，选择最近的端点
-                    return self._closest_endpoint_to_aabb(P0, P1, min_bounds, max_bounds)
-            else:
-                # 线段与AABB不相交，选择最近的端点
-                return self._closest_endpoint_to_aabb(P0, P1, min_bounds, max_bounds)
-            
-            # 计算最近点
-            closest_point = P0 + t_closest * segment_dir
-            return closest_point
-            
-        except Exception as e:
-            print(f"线段裁剪计算出错: {e}")
-            return self._closest_endpoint_to_aabb(P0, P1, min_bounds, max_bounds)
-
-        
-    def _closest_endpoint_to_aabb(self, P0, P1, min_bounds, max_bounds):
-        """选择线段端点中到AABB最近的点"""
-        try:
-            dist_P0 = self._distance_point_to_aabb_numeric(P0, min_bounds, max_bounds)
-            dist_P1 = self._distance_point_to_aabb_numeric(P1, min_bounds, max_bounds)
-            
-            return P0 if dist_P0 <= dist_P1 else P1
-        except:
-            return P0
-
-    def _distance_point_to_aabb_numeric(self, point, min_bounds, max_bounds):
-        """点到AABB的距离 - 修正版本"""
-        try:
-            # 计算点到AABB各面的最小距离
-            dx = max(min_bounds[0] - point[0], point[0] - max_bounds[0], 0)
-            dy = max(min_bounds[1] - point[1], point[1] - max_bounds[1], 0)
-            dz = max(min_bounds[2] - point[2], point[2] - max_bounds[2], 0)
-            
-            # 如果点在AABB内部，至少有一个距离分量为0
-            if dx == 0 and dy == 0 and dz == 0:
-                return 0.0
-            
-            # 否则返回欧几里得距离
-            return np.sqrt(dx*dx + dy*dy + dz*dz)
-            
-        except Exception as e:
-            print(f"点到AABB距离计算出错: {e}")
-            return 0.0
-
-
-    def _distance_segment_to_box_exact_numeric(self, P0, P1, box):
-        """精确的线段到长方体距离计算 - 简化版本"""
-        try:
-            # 对于轴对齐长方体，AABB方法已经足够精确
-            return self._distance_segment_to_aabb_numeric(P0, P1, box)
-            
-        except Exception as e:
-            print(f"精确距离计算出错: {e}")
-            return float('inf')
-    
-    def _get_environment_obstacles(self):
-        """获取环境中的长方体障碍物（八顶点模型）"""
-        box_obstacles = []
-        for obs in self.obstacles_rrt:  # 使用新的障碍物定义
-            x, y, z, length_x, length_y, length_z = obs
-            
-            # 计算长方体的8个顶点
-            half_x, half_y, half_z = length_x/2, length_y/2, length_z/2
-            
-            # 8个顶点的相对坐标（以中心为原点）
-            vertices_relative = np.array([
-                [-half_x, -half_y, -half_z],  # 0: 左下后
-                [ half_x, -half_y, -half_z],  # 1: 右下后
-                [ half_x,  half_y, -half_z],  # 2: 右上后
-                [-half_x,  half_y, -half_z],  # 3: 左上后
-                [-half_x, -half_y,  half_z],  # 4: 左下前
-                [ half_x, -half_y,  half_z],  # 5: 右下前
-                [ half_x,  half_y,  half_z],  # 6: 右上前
-                [-half_x,  half_y,  half_z],  # 7: 左上前
-            ])
-            
-            # 转换到世界坐标系
-            center = np.array([x, y, z])
-            vertices_world = vertices_relative + center
-            
-            # 定义6个面（每个面用4个顶点索引）
-            faces = [
-                [0, 1, 2, 3],  # 底面
-                [4, 5, 6, 7],  # 顶面
-                [0, 1, 5, 4],  # 前面
-                [2, 3, 7, 6],  # 后面
-                [0, 3, 7, 4],  # 左面
-                [1, 2, 6, 5],  # 右面
-            ]
-            
-            box_obstacles.append({
-                'center': center,
-                'vertices': vertices_world,
-                'faces': faces,
-                'dimensions': [length_x, length_y, length_z],
-                'half_dimensions': [half_x, half_y, half_z]
-            })
-        
-        return box_obstacles
-    
-    def _compute_min_distance_to_obstacles(self, arm_points, rectangle_obstacles):
-        """计算机械臂到矩形障碍物的最小距离"""
-        min_dist = ca.inf
-        
-        for obs in rectangle_obstacles:
-            # 创建矩形障碍物的CasADi符号
-            C = ca.SX(3, 1)
-            C[0] = obs['center'][0]
-            C[1] = obs['center'][1]
-            C[2] = obs['center'][2]
-            
-            V0 = ca.SX(3, 1)
-            V0[0] = obs['v0'][0]
-            V0[1] = obs['v0'][1]
-            V0[2] = obs['v0'][2]
-            
-            V1 = ca.SX(3, 1)
-            V1[0] = obs['v1'][0]
-            V1[1] = obs['v1'][1]
-            V1[2] = obs['v1'][2]
-            
-            # 创建RECTANGLE对象（简化版）
-            rectangle = self._create_rectangle_object(C, V0, V1)
-            
-            # 计算机械臂各段到矩形障碍物的距离
-            for i in range(arm_points.shape[1] - 1):
-                p1 = arm_points[:, i]
-                p2 = arm_points[:, i + 1]
-                
-                # 计算线段到矩形的距离
-                p1p2 = p2 - p1
-                p1p2_norm = ca.norm_2(p1p2)
-                
-                dist = self._distance_segment_to_rectangle(rectangle, p1, p2, p1p2, p1p2_norm)
-                min_dist = ca.fmin(min_dist, dist)
-        
-        return min_dist
-    
-    def _create_rectangle_object(self, C, V0, V1):
-        """创建矩形对象（简化版RECTANGLE类）"""
-        # 计算矩形的四个顶点
-        V2 = C - V1  # V2 = C - V1
-        V3 = V2 + V0  # V3 = V2 + V0
-        
-        # 计算边长和单位向量
-        E0 = V1 - V0  # E0 = V1 - V0
-        E1 = V0 - V2  # E1 = V0 - V2
-        e0 = ca.norm_2(E0) / 2
-        e1 = ca.norm_2(E1) / 2
-        # 创建默认单位向量
-        default_u0 = ca.SX(3, 1)
-        default_u0[0] = 1.0
-        default_u0[1] = 0.0
-        default_u0[2] = 0.0
-        
-        default_u1 = ca.SX(3, 1)
-        default_u1[0] = 0.0
-        default_u1[1] = 1.0
-        default_u1[2] = 0.0
-        
-        u0 = ca.if_else(e0 > 1e-6, E0 / (2 * e0), default_u0)
-        u1 = ca.if_else(e1 > 1e-6, E1 / (2 * e1), default_u1)
-        
-        return {
-            'C': C,
-            'V0': V0,
-            'V1': V1,
-            'V2': V2,
-            'V3': V3,
-            'E0': E0,
-            'E1': E1,
-            'e0': e0,
-            'e1': e1,
-            'u0': u0,
-            'u1': u1
-        }
-    
-    def _distance_segment_to_rectangle(self, rectangle, P0, P1, P0P1, P0P1_norm):
-        """计算线段到矩形的距离（基于CBF的distance_segment_to_rectangle）"""
-        # 提取矩形参数
-        C = rectangle['C']
-        V0 = rectangle['V0']
-        V1 = rectangle['V1']
-        V2 = rectangle['V2']
-        V3 = rectangle['V3']
-        e0 = rectangle['e0']
-        e1 = rectangle['e1']
-        u0 = rectangle['u0']
-        u1 = rectangle['u1']
-        
-        # 计算投影参数
-        CP0 = P0 - C
-        CP1 = P1 - C
-        a0 = ca.dot(CP0, u0)
-        b0 = ca.dot(CP0, u1)
-        a1 = ca.dot(CP1, u0)
-        b1 = ca.dot(CP1, u1)
-        
-        # 预计算常用值
-        a0Se0 = a0 - e0
-        a1Se0 = a1 - e0
-        a0Ae0 = a0 + e0
-        a1Ae0 = a1 + e0
-        b0Se1 = b0 - e1
-        b1Se1 = b1 - e1
-        b0Ae1 = b0 + e1
-        b1Ae1 = b1 + e1
-        b1Sb0 = b1 - b0
-        a1Sa0 = a1 - a0
-        
-        # 计算投影点
-        PC0 = C + a0 * u0 + b0 * u1
-        PC1 = C + a1 * u0 + b1 * u1
-        
-        # 计算交点（简化版，只考虑主要情况）
-        P_e0 = ca.if_else(a1Sa0 != 0, 
-                         C + e0 * u0 + ((-a0Se0/a1Sa0) * b1Sb0 + b0) * u1, 
-                         C + e0 * u0 + b0 * u1)
-        P_ne0 = ca.if_else(a1Sa0 != 0, 
-                          C - e0 * u0 + ((-a0Ae0/a1Sa0) * b1Sb0 + b0) * u1, 
-                          C - e0 * u0 + b0 * u1)
-        P_e1 = ca.if_else(b1Sb0 != 0, 
-                         C + ((-b0Se1/b1Sb0) * a1Sa0 + a0) * u0 + e1 * u1, 
-                         C + a0 * u0 + e1 * u1)
-        P_ne1 = ca.if_else(b1Sb0 != 0, 
-                          C + ((-b0Ae1/b1Sb0) * a1Sa0 + a0) * u0 - e1 * u1, 
-                          C + a0 * u0 - e1 * u1)
-        
-        # 计算各种情况下的距离（简化版）
-        # 1. 投影与矩形框无交点
-        S2R1 = ca.if_else(ca.logic_and(a0Se0 > 0, a1Se0 > 0), 
-                         self._distance_segment_to_segment(V1, V3, P0, P1, P0P1, P0P1_norm), 0)
-        S2R2 = ca.if_else(ca.logic_and(a0Ae0 < 0, a1Ae0 < 0), 
-                         self._distance_segment_to_segment(V0, V2, P0, P1, P0P1, P0P1_norm), 0)
-        S2R3 = ca.if_else(ca.logic_and(b0Se1 > 0, b1Se1 > 0), 
-                         self._distance_segment_to_segment(V0, V1, P0, P1, P0P1, P0P1_norm), 0)
-        S2R4 = ca.if_else(ca.logic_and(b0Ae1 < 0, b1Ae1 < 0), 
-                         self._distance_segment_to_segment(V2, V3, P0, P1, P0P1, P0P1_norm), 0)
-        
-        # 2. 投影在矩形内部
-        S2R5 = ca.if_else(ca.logic_and(ca.logic_and(a0Ae0 > 0, a0Se0 < 0), 
-                                      ca.logic_and(a1Ae0 > 0, a1Se0 < 0)),
-                         ca.if_else(ca.logic_and(ca.logic_and(b0Ae1 > 0, b0Se1 < 0), 
-                                                ca.logic_and(b1Ae1 > 0, b1Se1 < 0)),
-                                   self._distance_segment_to_segment(PC0, PC1, P0, P1, P0P1, P0P1_norm), 0), 0)
-        
-        # 3. 投影与矩形边界相交
-        S2R6 = ca.if_else(ca.logic_and(ca.logic_and(a0Se0 * a1Se0 <= 0, b0Se1 * b1Se1 <= 0),
-                                      ca.logic_and(a1Sa0 != 0, b1Sb0 != 0)),
-                         self._distance_point_to_segment(V1, P0, P1, P0P1, P0P1_norm), 0)
-        S2R7 = ca.if_else(ca.logic_and(ca.logic_and(a0Ae0 * a1Ae0 <= 0, b0Se1 * b1Se1 <= 0),
-                                      ca.logic_and(a1Sa0 != 0, b1Sb0 != 0)),
-                         self._distance_point_to_segment(V0, P0, P1, P0P1, P0P1_norm), 0)
-        S2R8 = ca.if_else(ca.logic_and(ca.logic_and(a0Ae0 * a1Ae0 <= 0, b0Ae1 * b1Ae1 <= 0),
-                                      ca.logic_and(a1Sa0 != 0, b1Sb0 != 0)),
-                         self._distance_point_to_segment(V2, P0, P1, P0P1, P0P1_norm), 0)
-        S2R9 = ca.if_else(ca.logic_and(ca.logic_and(a0Se0 * a1Se0 <= 0, b0Ae1 * b1Ae1 <= 0),
-                                      ca.logic_and(a1Sa0 != 0, b1Sb0 != 0)),
-                         self._distance_point_to_segment(V3, P0, P1, P0P1, P0P1_norm), 0)
-        
-        # 4. 特殊情况：线段与矩形边界重合
-        S2R10 = ca.if_else(ca.logic_and(a1Sa0 == 0, b1Sb0 == 0),
-                          ca.if_else(ca.logic_and(a0Se0 == 0, b0Se1 == 0),
-                                    self._distance_segment_to_segment(V0, V1, P0, P1, P0P1, P0P1_norm), 0), 0)
-        
-        # 返回所有情况的最小距离
-        return S2R1 + S2R2 + S2R3 + S2R4 + S2R5 + S2R6 + S2R7 + S2R8 + S2R9 + S2R10
-    
-    def _distance_segment_to_segment(self, Q0, Q1, P0, P1, P0P1, P0P1_norm):
-        """计算线段到线段的距离（基于CBF的distance_segment_to_segment）"""
-        # 向量计算
-        Q0Q1 = Q1 - Q0
-        Q0Q1_norm = ca.norm_2(Q0Q1)
-        Q0P0 = P0 - Q0
-        P1Q1 = Q1 - P1
-        
-        # 避免除零
-        t = ca.if_else(Q0Q1_norm > 1e-6, 
-                      ca.dot(Q0P0, Q0Q1) / (Q0Q1_norm * Q0Q1_norm), 
-                      0)
-        t = ca.fmax(0, ca.fmin(1, t))
-        
-        # 最近点
-        closest_point = Q0 + t * Q0Q1
-        
-        # 计算距离
-        distance = self._distance_point_to_segment(closest_point, P0, P1, P0P1, P0P1_norm)
-        return distance
-    
-    def _distance_point_to_segment(self, point, p1, p2, p1p2, p1p2_norm):
-        """计算点到线段的距离（基于CBF的distance_point_to_segment）"""
-        # 向量计算
-        p1p = point - p1
-        
-        # 避免除零
-        t = ca.if_else(p1p2_norm > 1e-6, 
-                      ca.dot(p1p, p1p2) / (p1p2_norm * p1p2_norm), 
-                      0)
-        
-        # 限制t在[0,1]范围内
-        t = ca.fmax(0, ca.fmin(1, t))
-        
-        # 最近点
-        closest_point = p1 + t * p1p2
-        
-        # 距离
-        distance = ca.norm_2(point - closest_point)
-        
-        return distance
-    
-    def _point_to_segment_distance(self, point, p1, p2):
-        """计算点到线段的距离"""
-        # 向量计算
-        p1p2 = p2 - p1
-        p1p2_norm = ca.norm_2(p1p2)
-        p1p = point - p1
-        
-        # 避免除零
-        t = ca.if_else(p1p2_norm > 1e-6, 
-                      ca.dot(p1p, p1p2) / (p1p2_norm * p1p2_norm), 
-                      0)
-        
-        # 限制t在[0,1]范围内
-        t = ca.fmax(0, ca.fmin(1, t))
-        
-        # 最近点
-        closest_point = p1 + t * p1p2
-        
-        # 距离
-        distance = ca.norm_2(point - closest_point)
-        
-        return distance
-
-    def sample_random_config(self):
-        """在关节限制内随机采样机械臂配置"""
-        config = []
-        for i in range(self.arm_dofs):
-            low, high = self.arm_joint_limits[i]
-            config.append(np.random.uniform(low, high))
-        return config
-
-    def sample_random_layer(self, base_path, tree_a, tree_b, is_tree_a=True):
-        """只在没有节点的层进行采样"""
-        # 获取所有已探索的层
-        explored_layers_a = set(node.layer_idx for node in tree_a.nodes)
-        explored_layers_b = set(node.layer_idx for node in tree_b.nodes)
-        all_explored_layers = explored_layers_a.union(explored_layers_b)
-        
-        # 找出所有未探索的层
-        all_layers = set(range(len(base_path)))
-        unexplored_layers = list(all_layers - all_explored_layers)
-        
-        if not unexplored_layers:
-            # 如果所有层都已探索，则随机选择一个层
-            selected_layer = np.random.randint(0, len(base_path))
-            print(f"所有层已探索，随机选择层: {selected_layer}")
-        else:
-            # 优先选择未探索的层
-            selected_layer = np.random.choice(unexplored_layers)
-            # print(f"未探索层: {sorted(unexplored_layers)}, 选择层: {selected_layer}")
-        
-        return selected_layer
-
-    def find_nearest_node(self, tree, target_config, target_layer, is_tree_a=True):
-        """
-        改进的最近邻搜索 - 区分 TreeA 和 TreeB 的扩展方向
-        """
-        min_distance = float('inf')
-        nearest_node = None
-        
-        if not tree.nodes:
-            return None
-        
-        for node in tree.nodes:
-            # 配置距离
-            config_distance = self.distance(node.config, target_config)
-            
-            # 层距离 - 根据树类型调整
-            layer_diff = target_layer - node.layer_idx
-            
-            if is_tree_a:
-                # TreeA: 向前扩展（层索引增加方向）
-                if layer_diff < 0:
-                    # 目标层在已探索层之前，大惩罚
-                    layer_penalty = 5.0
-                elif layer_diff == 0:
-                    # 同一层，中等惩罚（鼓励向前）
-                    layer_penalty = 1.0
-                else:
-                    # 目标层在已探索层之后，小惩罚
-                    layer_penalty = layer_diff * 0.05
-            else:
-                # TreeB: 向后扩展（层索引减少方向）
-                if layer_diff > 0:
-                    # 目标层在已探索层之后，大惩罚
-                    layer_penalty = 5.0
-                elif layer_diff == 0:
-                    # 同一层，中等惩罚（鼓励向后）
-                    layer_penalty = 1.0
-                else:
-                    # 目标层在已探索层之前，小惩罚
-                    layer_penalty = abs(layer_diff) * 0.05
-                    
-            total_distance = config_distance + layer_penalty
-            
-            if total_distance < min_distance:
-                min_distance = total_distance
-                nearest_node = node
-                
-        return nearest_node
-
-    def distance(self, config1, config2):
-        """计算两个机械臂配置之间的欧氏距离"""
-        return np.linalg.norm(np.array(config1) - np.array(config2))
-
-    def steer(self, from_config, to_config, step_size):
-        """从起始配置向目标配置移动一步"""
-        from_arr = np.array(from_config)
-        to_arr = np.array(to_config)
-        
-        direction = to_arr - from_arr
-        distance = np.linalg.norm(direction)
-        
-        if distance <= step_size:
-            return to_config
-        else:
-            return (from_arr + direction / distance * step_size).tolist()
-
-    def configurations_close(self, config1, config2, tolerance=0.1):
-        """检查两个配置是否接近"""
-        return self.distance(config1, config2) < tolerance
-
-    def reconstruct_full_path(self, tree_a, tree_b, connection_node, base_path):
-        """重建完整的移动操纵器路径"""
-        print(f"重建路径 - 连接节点: 层{connection_node.layer_idx}, 基座{connection_node.base_pose}")
-        
-        # 方法1: 直接从base_path重建完整路径，使用RRT找到的有效配置
-        full_path = []
-        
-        # 统计RRT找到的有效配置数量
-        rrt_configs_found = 0
-        default_configs_used = 0
-        
-        # 遍历所有层，为每层找到最接近的RRT节点配置
-        for layer_idx in range(len(base_path)):
-            best_config = None
-            min_distance = float('inf')
-            
-            # 在树A中寻找最接近的配置
-            for node in tree_a.nodes:
-                if node.layer_idx == layer_idx:
-                    # 如果该层有节点，直接使用
-                    best_config = node.config
-                    break
-                elif abs(node.layer_idx - layer_idx) <= 1:
-                    # 如果相邻层有节点，计算距离
-                    distance = abs(node.layer_idx - layer_idx)
-                    if distance < min_distance:
-                        min_distance = distance
-                        best_config = node.config
-            
-            # 在树B中寻找更接近的配置
-            for node in tree_b.nodes:
-                if node.layer_idx == layer_idx:
-                    best_config = node.config
-                    break
-                elif abs(node.layer_idx - layer_idx) <= 1:
-                    distance = abs(node.layer_idx - layer_idx)
-                    if distance < min_distance:
-                        min_distance = distance
-                        best_config = node.config
-            
-            # 如果没有找到配置，尝试找到安全的默认配置
-            if best_config is None:
-                # 尝试几个不同的安全配置
-                safe_configs = [
-                    [0.0, 0.3, -0.8, 0.0, 0.0],  # 更收缩的配置
-                    [0.0, 0.1, -0.5, 0.0, 0.0],  # 非常收缩的配置
-                    [0.0, 0.0, 0.0, 0.0, 0.0],   # 完全收缩的配置
-                    [0.0, 0.5, -0.6, 0.0, 0.0], # 原始默认配置
-                ]
-                
-                best_config = None
-                for config in safe_configs:
-                    if self.is_configuration_valid(config, base_pose):
-                        best_config = config
-                        break
-                
-                # 如果所有配置都不安全，使用最收缩的配置
-                if best_config is None:
-                    best_config = [0.0, 0.0, 0.0, 0.0, 0.0]
-                
-                default_configs_used += 1
-            else:
-                rrt_configs_found += 1
-            
-            # 使用base_path中对应层的基座位姿
-            base_pose = base_path[layer_idx]
-            full_state = base_pose + tuple(best_config)
-            full_path.append(full_state)
-        
-        print(f"  RRT配置统计: 找到{rrt_configs_found}个, 使用默认{default_configs_used}个")
-        
-        # 验证路径安全性
-        unsafe_points = 0
-        for i, point in enumerate(full_path):
-            base_pose = point[:3]
-            arm_config = point[3:]
-            if not self.is_configuration_valid(arm_config, base_pose):
-                unsafe_points += 1
-                if unsafe_points <= 3:  # 只打印前3个不安全点
-                    print(f"    警告: 点{i}不安全 - 基座{base_pose}, 配置{arm_config}")
-        
-        if unsafe_points > 0:
-            print(f"  路径安全性: {len(full_path)-unsafe_points}/{len(full_path)}个点安全")
-        else:
-            print(f"  路径安全性: 所有{len(full_path)}个点都安全")
-        
-        print(f"  重建完整路径: {len(full_path)}个点")
-        if len(full_path) > 0:
-            print(f"    起点: {full_path[0][:3]}")
-            print(f"    终点: {full_path[-1][:3]}")
-        return full_path
-
-    def smooth_full_path(self, path):
-        """平滑完整路径"""
-        if len(path) < 3:
-            return path
-            
-        # 使用简单的平滑算法
-        smoothed_path = [path[0]]
-        
-        for i in range(1, len(path)-1):
-            # 检查是否可以跳过中间点
-            if not self.is_collision_free(smoothed_path[-1], path[i+1]):
-                smoothed_path.append(path[i])
-                
-        smoothed_path.append(path[-1])
-        return smoothed_path
-
-    def is_collision_free(self, state1, state2):
-        """检查从状态1到状态2的路径是否无碰撞"""
-        # 简化的线性插值碰撞检测
-        steps = 5  # 减少步数以加快检测
-        for i in range(steps + 1):
-            t = i / steps
-            interpolated_state = [
-                state1[j] * (1-t) + state2[j] * t for j in range(len(state1))
-            ]
-            base_pose = tuple(interpolated_state[:3])
-            arm_config = interpolated_state[3:]
-            
-            if not self.is_configuration_valid(arm_config, base_pose):
-                return False
-                
-        return True
-
-
-
 
     def smooth_path_3d(self, path, weight_data=0.1, weight_smooth=0.3, tolerance=0.00001):
         """3D路径平滑处理（保持yaw角度）"""
@@ -1913,7 +743,6 @@ class IsaacGymEnv(VecEnv):
         # 路径相关变量
         self.paths = [None] * self.num_envs
         self.smoothed_paths = [None] * self.num_envs
-        self.rrt_full_paths = [None] * self.num_envs  # 添加RRT全身路径存储
         self.current_waypoint_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.waypoint_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
@@ -1931,104 +760,45 @@ class IsaacGymEnv(VecEnv):
 
 
     def _initial_path_planning(self):
-        """初始路径规划 - 包含A*和RRT"""
+        """初始路径规划 - 包含3D平滑"""
         starts = []
         goals = []
         
         for env_id in range(self.num_envs):
-            # 使用初始位置作为起点
+            # 使用初始位置作为起点（包含yaw角度）
             starts.append([0.0, 0.0, 0.0])  # 初始位置 (0,0,0) - 包含yaw
             goals.append([7.0, 0.0, 0.0])   # 目标位置 (7,0,0) - 包含yaw
         
-        # 1. 使用A*规划基座路径
-        base_paths = self.planner.plan_paths_parallel(starts, goals, self.num_envs)
+        # 规划路径
+        new_paths = self.planner.plan_paths_parallel(starts, goals, self.num_envs)
         
-        # 更新基座路径
+        # 更新路径
         for env_id in range(self.num_envs):
-            if base_paths[env_id] is not None:
+            if new_paths[env_id] is not None:
                 # 使用3D平滑路径
-                smoothed_base_path = self.planner.smooth_path_3d(base_paths[env_id])
-                self.paths[env_id] = base_paths[env_id]
-                self.smoothed_paths[env_id] = smoothed_base_path
+                smoothed_path = self.planner.smooth_path_3d(new_paths[env_id])
+                full_path = smoothed_path
+                
+                self.paths[env_id] = new_paths[env_id]  # 保留原始路径
+                self.smoothed_paths[env_id] = full_path  # 使用平滑后的路径
                 self.current_waypoint_idx[env_id] = 0
+                print(f"Environment {env_id} path planned with {len(full_path)} waypoints (smoothed)")
                 
-                # 2. 使用RRT-Connect规划全身路径
-                start_arm_config = [0.0, 0.5, -0.6, 0.0, 0.0]  # 初始机械臂配置
-                goal_arm_config = [0.0, 0.5, -0.6, 0.0, 0.0]   # 目标机械臂配置
-                
-                print(f"Env {env_id} 开始RRT规划:")
-                print(f"  - 起始机械臂配置: {start_arm_config}")
-                print(f"  - 目标机械臂配置: {goal_arm_config}")
-                print(f"  - 基座路径长度: {len(smoothed_base_path)}")
-                print(f"  - smoothed长度: {len(smoothed_base_path)}")
-                rrt_path = self.planner.multilayer_rrt_connect(
-                    base_path=smoothed_base_path,
-                    start_arm_config=start_arm_config,
-                    goal_arm_config=goal_arm_config,
-                    max_iterations=500,  # 可根据需要调整
-                    step_size=0.1
-                )
-                
-                
-                if rrt_path:
-                    self.rrt_full_paths[env_id] = rrt_path
-                    print(f"Env {env_id} RRT全身路径规划成功! 路径点数: {len(rrt_path)}")
-                    
-                    # 验证基座路径一致性
-                    rrt_base_poses = [point[:3] for point in rrt_path]  # 提取基座位姿
-                    print(f"  - RRT路径基座位姿数量: {len(rrt_base_poses)}")
-                    print(f"  - 原始基座路径数量: {len(smoothed_base_path)}")
-                    
-                    # 检查前几个点的基座位姿是否一致
-                    print(f"  - RRT路径前5个点:")
-                    for i in range(min(5, len(rrt_base_poses))):
-                        rrt_pose = rrt_base_poses[i]
-                        print(f"    点{i}: {rrt_pose}")
-                    
-                    print(f"  - 原始基座路径前5个点:")
-                    for i in range(min(5, len(smoothed_base_path))):
-                        orig_pose = smoothed_base_path[i]
-                        print(f"    点{i}: {orig_pose}")
-                    
-                    # 检查路径方向是否正确
-                    if len(rrt_base_poses) >= 2 and len(smoothed_base_path) >= 2:
-                        rrt_start = rrt_base_poses[0]
-                        rrt_end = rrt_base_poses[-1]
-                        orig_start = smoothed_base_path[0]
-                        orig_end = smoothed_base_path[-1]
-                        print(f"  - RRT路径: {rrt_start} -> {rrt_end}")
-                        print(f"  - 原始路径: {orig_start} -> {orig_end}")
-                        
-                        # 检查起点是否匹配
-                        start_match = abs(rrt_start[0] - orig_start[0]) < 0.1 and abs(rrt_start[1] - orig_start[1]) < 0.1
-                        print(f"  - 起点匹配: {start_match}")
-                    else:
-                        print(f"Env {env_id} RRT规划失败，将使用基座路径")
-                        # 创建默认的全身路径（基座路径 + 固定机械臂配置）
-                        default_full_path = []
-                        for base_pose in smoothed_base_path:
-                            full_state = base_pose + tuple(start_arm_config)
-                            default_full_path.append(full_state)
-                        self.rrt_full_paths[env_id] = default_full_path
-                else:
-                    print(f"Warning: A*路径规划失败 for env {env_id}")
-                    # 创建默认的直线路径作为fallback
-                    default_path = [
-                        (0.0, 0.0, 0.0),  # 起点
-                        (3.5, 0.0, 0.0),  # 中间点
-                        (7.0, 0.0, 0.0)   # 终点
-                    ]
-                    self.paths[env_id] = default_path
-                    self.smoothed_paths[env_id] = default_path
-                    self.current_waypoint_idx[env_id] = 0
+                # 打印路径信息用于调试
+                print(f"Env {env_id} original path points: {len(new_paths[env_id])}")
+                print(f"Env {env_id} smoothed path points: {len(full_path)}")
+                print(f"Env {env_id} path: {full_path[:3]}...{full_path[-3:] if len(full_path) > 6 else ''}")
+            else:
+                print(f"Warning: Path planning failed for env {env_id}")
+                # 创建默认的直线路径作为fallback
+                default_path = [
+                    (0.0, 0.0, 0.0),  # 起点
+                    (3.5, 0.0, 0.0),  # 中间点
+                    (7.0, 0.0, 0.0)   # 终点
+                ]
+                self.smoothed_paths[env_id] = default_path
+                self.current_waypoint_idx[env_id] = 0
 
-                    # 创建默认的全身路径
-                    start_arm_config = [0.0, 0.5, -0.6, 0.0, 0.0]
-                    default_full_path = []
-                    for base_pose in default_path:
-                        full_state = base_pose + tuple(start_arm_config)
-                        default_full_path.append(full_state)
-                    self.rrt_full_paths[env_id] = default_full_path
 
 
 
@@ -2247,9 +1017,11 @@ class IsaacGymEnv(VecEnv):
         base_pos = self.state.root_pos[0].cpu().numpy()  # 第0个环境的位置
         # 获取机器人基座四元数 (x, y, z, w)
         base_quat = self.state.root_xyzw_quat[0].cpu().numpy()  # 第0个环境的四元数
+        
+        print("base_height =", base_pos[2])
 
         # 将四元数转换为欧拉角 (roll, pitch, yaw)
-        
+        from scipy.spatial.transform import Rotation as R
         r = R.from_quat(base_quat)
         euler_angles = r.as_euler('xyz', degrees=False)
         
@@ -2381,49 +1153,16 @@ class IsaacGymEnv(VecEnv):
 
     def update_base_arm_pos_pid(self,env_idx):  
         """使用路径点更新基座和手臂位置"""
-        # 获取当前路径点作为目
+        # 获取当前路径点作为目标
+        current_waypoint = self.smoothed_paths[env_idx][self.current_waypoint_idx[env_idx]]
 
-        # 如果有RRT全身路径，优先使用
-        if (self.rrt_full_paths[env_idx] is not None and 
-            len(self.rrt_full_paths[env_idx]) > 0 and
-            self.current_waypoint_idx[env_idx] < len(self.rrt_full_paths[env_idx])):
-            
-            current_waypoint = self.rrt_full_paths[env_idx][self.current_waypoint_idx[env_idx]]
-            
-            # 提取基座位姿和机械臂配置
-            target_base_pose = current_waypoint[:3]  # x, y, yaw
-            target_arm_config = current_waypoint[3:] # q1, q2, q3, q4, q5
-            
-            # 确保数据类型一致（RRT路径是列表，基座路径是tensor）
-            if hasattr(target_base_pose[0], 'item'):
-                # 如果是tensor，转换为float
-                target_base_arm_joint = [
-                    target_base_pose[0].item(),  # x
-                    target_base_pose[1].item(),  # y 
-                    target_base_pose[2].item(),  # yaw
-                ] + [float(x) if hasattr(x, 'item') else x for x in target_arm_config]
-            else:
-                # 如果是列表，直接使用
-                target_base_arm_joint = list(target_base_pose) + list(target_arm_config)
-            
-        else:
-            # 回退到基座路径
-            if (self.smoothed_paths[env_idx] is not None and 
-                len(self.smoothed_paths[env_idx]) > 0 and
-                self.current_waypoint_idx[env_idx] < len(self.smoothed_paths[env_idx])):
-                
-                current_waypoint = self.smoothed_paths[env_idx][self.current_waypoint_idx[env_idx]]
-
-                # 使用基座路径点 + 默认机械臂配置
-                target_base_arm_joint = [
-                    current_waypoint[0].item(),  # x
-                    current_waypoint[1].item(),  # y 
-                    current_waypoint[2].item(),  # yaw
-                    0.0, 0.5, -0.6, 0.0, 0.0    # 默认机械臂关节
-                ]
-            else:
-                # 如果没有路径，使用固定目标
-                target_base_arm_joint = [7.0, 0.0, 0.3, 0.0, 0.5, -0.6, 0.0, 0.0]
+        # 使用路径点作为基座目标
+        target_base_arm_joint = [
+            current_waypoint[0].item(),  # x
+            current_waypoint[1].item(),  # y 
+            current_waypoint[2].item(),  # yaw
+            0.0, 0.5, -0.6, 0.0, 0.0    # 手臂关节
+        ]
         
         target_base_arm_vel = []
         for i in range(8):
@@ -2490,54 +1229,33 @@ class IsaacGymEnv(VecEnv):
         num_actors_per_env = 5  # 每个环境有5个actor
         
         for env_id in range(self.num_envs):
-            # 确定使用哪个路径进行跟踪
-            current_path = None
-            if (self.rrt_full_paths[env_id] is not None and 
-                len(self.rrt_full_paths[env_id]) > 0):
-                current_path = self.rrt_full_paths[env_id]
-                path_type = "RRT全身路径"
-            elif (self.smoothed_paths[env_id] is not None and 
-                  len(self.smoothed_paths[env_id]) > 0):
-                current_path = self.smoothed_paths[env_id]
-                path_type = "基座路径"
-            else:
-                continue
-            
-            # 检查路径索引是否有效
-            if self.current_waypoint_idx[env_id] >= len(current_path):
+            if (self.smoothed_paths[env_id] is None or 
+                self.current_waypoint_idx[env_id] >= len(self.smoothed_paths[env_id])):
                 continue
             
             # 获取当前路径点
-            current_waypoint = current_path[self.current_waypoint_idx[env_id]]
+            current_waypoint = self.smoothed_paths[env_id][self.current_waypoint_idx[env_id]]
             
             # 获取机器人当前位置（第一个actor是机器人）
             robot_actor_idx = env_id * num_actors_per_env
             robot_pos = self.state.root_state[robot_actor_idx, 0:3].cpu().numpy()  # [x, y, z]
             
             # 计算到当前路径点的距离（只考虑x,y）
-            # 处理不同的数据类型
-            if hasattr(current_waypoint[0], 'item'):
-                target_x = current_waypoint[0].item()
-                target_y = current_waypoint[1].item()
-            else:
-                target_x = current_waypoint[0]
-                target_y = current_waypoint[1]
-            
             distance = np.sqrt(
-                (robot_pos[0] - target_x)**2 + 
-                (robot_pos[1] - target_y)**2
+                (robot_pos[0] - current_waypoint[0].item())**2 + 
+                (robot_pos[1] - current_waypoint[1].item())**2
             )
             
             # 检查是否到达路径点
             if distance < self.waypoint_threshold:
-                if self.current_waypoint_idx[env_id] < len(current_path) - 1:
-                    old_waypoint = current_path[self.current_waypoint_idx[env_id]]
+                if self.current_waypoint_idx[env_id] < len(self.smoothed_paths[env_id]) - 1:
+                    old_waypoint = self.smoothed_paths[env_id][self.current_waypoint_idx[env_id]]
                     self.current_waypoint_idx[env_id] += 1
-                    new_waypoint = current_path[self.current_waypoint_idx[env_id]]
-                    # print(f"Env {env_id}: Reached waypoint {old_waypoint}, moving to {new_waypoint} ({path_type})")
+                    new_waypoint = self.smoothed_paths[env_id][self.current_waypoint_idx[env_id]]
+                    print(f"Env {env_id}: Reached waypoint {old_waypoint}, moving to {new_waypoint}")
                 else:
                     self.waypoint_reached[env_id] = True
-                    # print(f"Env {env_id}: Reached final waypoint! ({path_type})") 
+                    print(f"Env {env_id}: Reached final waypoint!") 
 
     def _check_replan(self):
         """检查是否需要重新规划路径"""
@@ -2612,15 +1330,15 @@ class IsaacGymEnv(VecEnv):
                 self.h_list_min=self.h_list.min()
                 self.solve_time.append(process_once_time)
                 
-                # # 找到h_list_min对应的约束
-                # if hasattr(self, 'h_list') and len(self.h_list) > 0:
-                #     min_idx = np.argmin(self.h_list)
-                #     constraint_info = self.get_constraint_info(min_idx)
-                #     print(f"\n=== 最小约束信息 ===")
-                #     print(f"最小约束索引: {min_idx}")
-                #     print(f"约束信息: {constraint_info}")
-                #     print(f"约束值: {self.h_list[min_idx]:.6f}")
-                #     print("==================")
+                # 找到h_list_min对应的约束
+                if hasattr(self, 'h_list') and len(self.h_list) > 0:
+                    min_idx = np.argmin(self.h_list)
+                    constraint_info = self.get_constraint_info(min_idx)
+                    print(f"\n=== 最小约束信息 ===")
+                    print(f"最小约束索引: {min_idx}")
+                    print(f"约束信息: {constraint_info}")
+                    print(f"约束值: {self.h_list[min_idx]:.6f}")
+                    print("==================")
 
             self.target_base_arm_vel=self.update_base_arm_pos_pid(env_idx=0)
             current_base_arm_pos, current_base_arm_vel=self.update_joint_pos_vel()
@@ -2668,8 +1386,7 @@ class IsaacGymEnv(VecEnv):
             arm_torques = []
             for i in range(5):
                 # 直接使用CBF输出的速度作为目标速度，计算速度误差
-                # target_velocity = self.CBF_filter_velocity[i+3]
-                target_velocity = self.target_base_arm_vel[i+3]
+                target_velocity = self.CBF_filter_velocity[i+3]
                 current_velocity = self.current_joint_vel[i+3]
                 velocity_error = target_velocity - current_velocity
                 
@@ -3432,7 +2149,7 @@ class IsaacGymEnv(VecEnv):
         
         # 创建4个不同尺寸的box
         box_asset_1 = self.gym.create_box(
-            self.sim, 0.5, 1.4, 0.05, box_asset_options
+            self.sim, 0.5, 1.4, 0.01, box_asset_options
         )
         box_asset_2 = self.gym.create_box(
             self.sim, 0.5, 0.05, 0.6, box_asset_options
@@ -3655,7 +2372,7 @@ class IsaacGymEnv(VecEnv):
             box_handles_env = []
             
             # Box 1: 大box (0.5x0.7x0.05) - 在机器人前方
-            box1_offset = gymapi.Vec3(4.0, 0.0, 0.7)
+            box1_offset = gymapi.Vec3(4.0, 0.0, 0.6)
             # box1_offset = gymapi.Vec3(2.0, 0.0, 2.0)
             box1_pose = gymapi.Transform()
             box1_pose.p = start_pose.p + box1_offset
@@ -3672,7 +2389,7 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 2: 小box (0.05x0.05x0.6) - 在机器人左侧
-            box2_offset = gymapi.Vec3(4.0, -0.7, 0.35)
+            box2_offset = gymapi.Vec3(4.0, -0.7, 0.3)
             # box2_offset = gymapi.Vec3(2.0, -0.35, 2.0)
             box2_pose = gymapi.Transform()
             box2_pose.p = start_pose.p + box2_offset
@@ -3689,7 +2406,7 @@ class IsaacGymEnv(VecEnv):
             )
             
             # Box 3: 小box (0.05x0.05x0.6) - 在机器人右侧
-            box3_offset = gymapi.Vec3(4.0, 0.7, 0.35)
+            box3_offset = gymapi.Vec3(4.0, 0.7, 0.3)
             # box3_offset = gymapi.Vec3(2.0, 0.35, 2.0)
             box3_pose = gymapi.Transform()
             box3_pose.p = start_pose.p + box3_offset
@@ -3862,9 +2579,9 @@ class IsaacGymEnv(VecEnv):
                 
                 # 定义4个box的偏移位置
                 box_offsets = [
-                    torch.tensor([4.0, 0.0, 0.7], device=self.device),   # box1: 前方
-                    torch.tensor((4.0, -0.7, 0.35), device=self.device),  # box2: 左侧
-                    torch.tensor([4.0, 0.7, 0.35], device=self.device),   # box3: 右侧
+                    torch.tensor([4.0, 0.0, 0.6], device=self.device),   # box1: 前方
+                    torch.tensor((4.0, -0.7, 0.3), device=self.device),  # box2: 左侧
+                    torch.tensor([4.0, 0.7, 0.3], device=self.device),   # box3: 右侧
                     torch.tensor([2.0, 0.0, 0.15], device=self.device),   # box4: 前方
                     # torch.tensor([2.0, 0.0, 2.0], device=self.device),   # box1: 前方
                     # torch.tensor([2.0, -0.35, 2.0], device=self.device),  # box2: 左侧
