@@ -1495,7 +1495,7 @@ class SuppressOutput:
         sys.stdout.close()
         sys.stderr.close()
         sys.stdout = self._original_stdout
-        sys.stderr = self._original_stderr
+        sys.stderr = self._original_stderr 
 
 class PDController:
     """通用PD控制器（比例-微分控制）"""
@@ -2646,8 +2646,7 @@ class IsaacGymEnv(VecEnv):
                 DOB_in={'currrent_state':current_base_arm_pos,'ut':self.ut}
                 self.DOB_input.put(DOB_in)
 
-
-
+ 
             callback(self) if callback is not None else None
             # handle delay by indexing into the buffer of past targets
             # since new actions are pushed to the front of the buffer,

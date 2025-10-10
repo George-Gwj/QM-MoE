@@ -1150,7 +1150,7 @@ class IsaacGymEnv(VecEnv):
                 joint3_constraints[constraint_name] = self.h_list[constraint_idx]
         
         return joint3_constraints
-
+ 
     def update_base_arm_pos_pid(self,env_idx):  
         """使用路径点更新基座和手臂位置"""
         # 获取当前路径点作为目标
